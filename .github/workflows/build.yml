@@ -1,0 +1,863 @@
+name: build
+
+# Самодостаточный workflow: весь код мода встроен в этот файл.
+# Положите его в .github/workflows/build.yml пустого репозитория и запустите (Actions -> build -> Run workflow).
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 25
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.5.1
+
+      - name: Generate mod project
+        run: |
+          cat > 'gradle.properties' <<'WOLFPLUS_EOF'
+          org.gradle.jvmargs=-Xmx2G
+          org.gradle.parallel=true
+          # IntelliJ IDEA пока не полностью совместима с configuration cache
+          org.gradle.configuration-cache=false
+
+          # Fabric (https://fabricmc.net/develop)
+          minecraft_version=26.2
+          loader_version=0.19.3
+          loom_version=1.17-SNAPSHOT
+          fabric_api_version=0.161.0+26.2
+
+          # Мод
+          mod_version=1.0.0
+          maven_group=com.wolfplus
+          archives_base_name=wolfplus
+          WOLFPLUS_EOF
+          cat > 'settings.gradle' <<'WOLFPLUS_EOF'
+          pluginManagement {
+              repositories {
+                  maven {
+                      name = 'Fabric'
+                      url = 'https://maven.fabricmc.net/'
+                  }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          WOLFPLUS_EOF
+          cat > 'build.gradle' <<'WOLFPLUS_EOF'
+          plugins {
+              id 'net.fabricmc.fabric-loom' version "${loom_version}"
+              id 'maven-publish'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+
+          base {
+              archivesName = project.archives_base_name
+          }
+
+          repositories {
+          }
+
+          loom {
+              splitEnvironmentSourceSets()
+
+              mods {
+                  "wolfplus" {
+                      sourceSet sourceSets.main
+                      sourceSet sourceSets.client
+                  }
+              }
+          }
+
+          dependencies {
+              // Minecraft 26.x не обфусцирован: маппинги и remap не нужны
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+          }
+
+          processResources {
+              inputs.property "version", project.version
+
+              filesMatching("fabric.mod.json") {
+                  expand "version": inputs.properties.version
+              }
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              it.options.release = 25
+              it.options.encoding = "UTF-8"
+          }
+
+          java {
+              withSourcesJar()
+              sourceCompatibility = JavaVersion.VERSION_25
+              targetCompatibility = JavaVersion.VERSION_25
+          }
+          WOLFPLUS_EOF
+          mkdir -p 'src/client/java/com/wolfplus/client'
+          cat > 'src/client/java/com/wolfplus/client/UntameConfirmScreen.java' <<'WOLFPLUS_EOF'
+          package com.wolfplus.client;
+
+          import com.wolfplus.net.UntameWolfPayload;
+          import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
+          import net.minecraft.client.gui.GuiGraphicsExtractor;
+          import net.minecraft.client.gui.components.Button;
+          import net.minecraft.client.gui.screens.Screen;
+          import net.minecraft.network.chat.Component;
+
+          /**
+           * Двойное подтверждение расприручения.
+           * Шаг 1 - обычный вопрос. Шаг 2 - предупреждение; кнопки там поменяны местами,
+           * чтобы нельзя было случайно "дважды кликнуть в одно место".
+           */
+          public class UntameConfirmScreen extends Screen {
+              private final Screen parent;
+              private final int entityId;
+              private final int step;
+
+              public UntameConfirmScreen(Screen parent, int entityId, int step) {
+                  super(Component.translatable("wolfplus.untame.title" + step));
+                  this.parent = parent;
+                  this.entityId = entityId;
+                  this.step = step;
+              }
+
+              @Override
+              protected void init() {
+                  int cx = this.width / 2;
+                  int y = this.height / 2 + 10;
+
+                  Button yes = Button.builder(Component.translatable("wolfplus.untame.yes" + this.step), b -> onYes())
+                          .bounds(step == 1 ? cx - 105 : cx + 5, y, 100, 20).build();
+                  Button no = Button.builder(Component.translatable("wolfplus.untame.no"), b -> this.onClose())
+                          .bounds(step == 1 ? cx + 5 : cx - 105, y, 100, 20).build();
+
+                  this.addRenderableWidget(yes);
+                  this.addRenderableWidget(no);
+              }
+
+              private void onYes() {
+                  if (this.step == 1) {
+                      this.minecraft.gui.setScreen(new UntameConfirmScreen(this.parent, this.entityId, 2));
+                  } else {
+                      ClientPlayNetworking.send(new UntameWolfPayload(this.entityId));
+                      this.minecraft.gui.setScreen(null);
+                  }
+              }
+
+              /** Отмена / Esc: возвращаемся в меню волка. */
+              @Override
+              public void onClose() {
+                  this.minecraft.gui.setScreen(this.parent);
+              }
+
+              @Override
+              public void extractRenderState(GuiGraphicsExtractor graphics, int mouseX, int mouseY, float delta) {
+                  super.extractRenderState(graphics, mouseX, mouseY, delta);
+
+                  int cx = this.width / 2;
+                  int y = this.height / 2 - 30;
+
+                  String title = this.title.getString();
+                  graphics.text(this.font, title, cx - this.font.width(title) / 2, y, 0xFFFFFFFF, true);
+
+                  String line = Component.translatable("wolfplus.untame.text" + this.step).getString();
+                  graphics.text(this.font, line, cx - this.font.width(line) / 2, y + 16, 0xFFFF8080, true);
+              }
+          }
+          WOLFPLUS_EOF
+          mkdir -p 'src/client/java/com/wolfplus/client'
+          cat > 'src/client/java/com/wolfplus/client/WolfMenuScreen.java' <<'WOLFPLUS_EOF'
+          package com.wolfplus.client;
+
+          import com.wolfplus.WolfOptions;
+          import com.wolfplus.net.OpenWolfMenuPayload;
+          import com.wolfplus.net.WolfSettingsPayload;
+          import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
+          import net.minecraft.client.gui.GuiGraphicsExtractor;
+          import net.minecraft.client.gui.components.Button;
+          import net.minecraft.client.gui.components.EditBox;
+          import net.minecraft.client.gui.screens.Screen;
+          import net.minecraft.network.chat.Component;
+          import net.minecraft.world.item.DyeColor;
+
+          /** Меню настройки волка: имя, порода, цвет ошейника (+ расприручение). */
+          public class WolfMenuScreen extends Screen {
+              private static final DyeColor[] COLORS = DyeColor.values();
+
+              private final int entityId;
+              private final boolean firstTime;
+
+              private String name;
+              private int variant;
+              private int color;
+
+              private Button variantButton;
+              private Button colorButton;
+
+              public WolfMenuScreen(OpenWolfMenuPayload payload) {
+                  super(Component.translatable(payload.firstTime() ? "wolfplus.menu.title_new" : "wolfplus.menu.title"));
+                  this.entityId = payload.entityId();
+                  this.firstTime = payload.firstTime();
+                  this.name = payload.name();
+                  this.variant = Math.floorMod(payload.variantIndex(), WolfOptions.VARIANTS.size());
+                  this.color = Math.floorMod(payload.colorId(), COLORS.length);
+              }
+
+              private int top() {
+                  return this.height / 2 - 90;
+              }
+
+              @Override
+              protected void init() {
+                  int cx = this.width / 2;
+                  int top = top();
+
+                  // I. Имя
+                  EditBox nameBox = new EditBox(this.font, cx - 100, top + 26, 200, 20,
+                          Component.translatable("wolfplus.menu.name"));
+                  nameBox.setMaxLength(WolfOptions.MAX_NAME_LENGTH);
+                  nameBox.setValue(this.name);
+                  nameBox.setHint(Component.translatable("wolfplus.menu.name_hint"));
+                  nameBox.setResponder(value -> this.name = value);
+                  this.addRenderableWidget(nameBox);
+                  this.setInitialFocus(nameBox);
+
+                  // II. Порода
+                  int variantY = top + 66;
+                  this.addRenderableWidget(Button.builder(Component.literal("<"), b -> cycleVariant(-1))
+                          .bounds(cx - 100, variantY, 20, 20).build());
+                  this.variantButton = this.addRenderableWidget(Button.builder(variantLabel(), b -> cycleVariant(1))
+                          .bounds(cx - 78, variantY, 156, 20).build());
+                  this.addRenderableWidget(Button.builder(Component.literal(">"), b -> cycleVariant(1))
+                          .bounds(cx + 80, variantY, 20, 20).build());
+
+                  // III. Цвет ошейника
+                  int colorY = top + 106;
+                  this.addRenderableWidget(Button.builder(Component.literal("<"), b -> cycleColor(-1))
+                          .bounds(cx - 100, colorY, 20, 20).build());
+                  this.colorButton = this.addRenderableWidget(Button.builder(colorLabel(), b -> cycleColor(1))
+                          .bounds(cx - 78, colorY, 156, 20).build());
+                  this.addRenderableWidget(Button.builder(Component.literal(">"), b -> cycleColor(1))
+                          .bounds(cx + 80, colorY, 20, 20).build());
+
+                  // Кнопки
+                  this.addRenderableWidget(Button.builder(
+                                  Component.translatable(this.firstTime ? "wolfplus.menu.done" : "wolfplus.menu.save"),
+                                  b -> save())
+                          .bounds(cx - 100, top + 140, 200, 20).build());
+
+                  if (this.firstTime) {
+                      this.addRenderableWidget(Button.builder(Component.translatable("wolfplus.menu.skip"), b -> this.onClose())
+                              .bounds(cx - 100, top + 164, 200, 20).build());
+                  } else {
+                      this.addRenderableWidget(Button.builder(Component.translatable("wolfplus.menu.untame"),
+                                      b -> this.minecraft.gui.setScreen(new UntameConfirmScreen(this, this.entityId, 1)))
+                              .bounds(cx - 100, top + 164, 200, 20).build());
+                  }
+              }
+
+              private Component variantLabel() {
+                  return Component.translatable("wolfplus.menu.breed",
+                          Component.translatable("wolfplus.variant." + WolfOptions.VARIANTS.get(this.variant)));
+              }
+
+              private Component colorLabel() {
+                  DyeColor dye = COLORS[this.color];
+                  Component colorName = Component.translatable("color.minecraft." + dye.getName())
+                          .withColor(dye.getTextColor());
+                  return Component.translatable("wolfplus.menu.collar", colorName);
+              }
+
+              private void cycleVariant(int step) {
+                  this.variant = Math.floorMod(this.variant + step, WolfOptions.VARIANTS.size());
+                  this.variantButton.setMessage(variantLabel());
+              }
+
+              private void cycleColor(int step) {
+                  this.color = Math.floorMod(this.color + step, COLORS.length);
+                  this.colorButton.setMessage(colorLabel());
+              }
+
+              private void save() {
+                  ClientPlayNetworking.send(new WolfSettingsPayload(this.entityId, this.name, this.variant, COLORS[this.color].getId()));
+                  this.onClose();
+              }
+
+              @Override
+              public void extractRenderState(GuiGraphicsExtractor graphics, int mouseX, int mouseY, float delta) {
+                  super.extractRenderState(graphics, mouseX, mouseY, delta);
+
+                  int cx = this.width / 2;
+                  int top = top();
+                  drawCentered(graphics, this.title.getString(), cx, top, 0xFFFFFFFF);
+                  drawLabel(graphics, Component.translatable("wolfplus.menu.name").getString(), cx - 100, top + 14);
+                  drawLabel(graphics, Component.translatable("wolfplus.menu.breed_label").getString(), cx - 100, top + 54);
+                  drawLabel(graphics, Component.translatable("wolfplus.menu.collar_label").getString(), cx - 100, top + 94);
+              }
+
+              private void drawCentered(GuiGraphicsExtractor graphics, String text, int centerX, int y, int color) {
+                  graphics.text(this.font, text, centerX - this.font.width(text) / 2, y, color, true);
+              }
+
+              private void drawLabel(GuiGraphicsExtractor graphics, String text, int x, int y) {
+                  graphics.text(this.font, text, x, y, 0xFFA0A0A0, true);
+              }
+          }
+          WOLFPLUS_EOF
+          mkdir -p 'src/client/java/com/wolfplus/client'
+          cat > 'src/client/java/com/wolfplus/client/WolfPlusClient.java' <<'WOLFPLUS_EOF'
+          package com.wolfplus.client;
+
+          import com.wolfplus.net.OpenWolfMenuPayload;
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
+
+          public class WolfPlusClient implements ClientModInitializer {
+              @Override
+              public void onInitializeClient() {
+                  ClientPlayNetworking.registerGlobalReceiver(OpenWolfMenuPayload.TYPE, (payload, context) ->
+                          context.client().gui.setScreen(new WolfMenuScreen(payload)));
+              }
+          }
+          WOLFPLUS_EOF
+          mkdir -p 'src/main/java/com/wolfplus'
+          cat > 'src/main/java/com/wolfplus/WolfOptions.java' <<'WOLFPLUS_EOF'
+          package com.wolfplus;
+
+          import com.wolfplus.mixin.WolfAccess;
+          import java.util.List;
+          import net.minecraft.core.Holder;
+          import net.minecraft.core.registries.Registries;
+          import net.minecraft.resources.Identifier;
+          import net.minecraft.resources.ResourceKey;
+          import net.minecraft.world.entity.animal.wolf.Wolf;
+          import net.minecraft.world.entity.animal.wolf.WolfVariant;
+          import net.minecraft.world.level.Level;
+
+          /** Список пород (вариантов волка) и работа с ними. */
+          public final class WolfOptions {
+              /** Ванильные породы; порядок = порядок в меню. Названия: wolfplus.variant.<имя>. */
+              public static final List<String> VARIANTS = List.of(
+                      "pale", "spotted", "snowy", "black", "ashen", "rusty", "woods", "chestnut", "striped");
+
+              public static final int MAX_NAME_LENGTH = 32;
+
+              private WolfOptions() {
+              }
+
+              private static ResourceKey<WolfVariant> key(int index) {
+                  return ResourceKey.create(Registries.WOLF_VARIANT, Identifier.withDefaultNamespace(VARIANTS.get(index)));
+              }
+
+              /** Индекс текущей породы волка (0, если порода не из списка). */
+              public static int variantIndexOf(Wolf wolf) {
+                  Holder<WolfVariant> current = ((WolfAccess) wolf).wolfplus$getVariant();
+                  for (int i = 0; i < VARIANTS.size(); i++) {
+                      if (current.is(key(i))) {
+                          return i;
+                      }
+                  }
+                  return 0;
+              }
+
+              /** Ставит породу по индексу; неверный индекс игнорируется. */
+              public static void applyVariant(Wolf wolf, int index) {
+                  if (index < 0 || index >= VARIANTS.size()) {
+                      return;
+                  }
+                  Level level = wolf.level();
+                  level.registryAccess()
+                          .lookupOrThrow(Registries.WOLF_VARIANT)
+                          .get(key(index))
+                          .ifPresent(holder -> ((WolfAccess) wolf).wolfplus$setVariant(holder));
+              }
+          }
+          WOLFPLUS_EOF
+          mkdir -p 'src/main/java/com/wolfplus'
+          cat > 'src/main/java/com/wolfplus/WolfPlus.java' <<'WOLFPLUS_EOF'
+          package com.wolfplus;
+
+          import com.wolfplus.net.OpenWolfMenuPayload;
+          import com.wolfplus.net.UntameWolfPayload;
+          import com.wolfplus.net.WolfSettingsPayload;
+          import net.fabricmc.api.ModInitializer;
+          import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
+          import net.minecraft.resources.Identifier;
+
+          public class WolfPlus implements ModInitializer {
+              public static final String MOD_ID = "wolfplus";
+
+              public static Identifier id(String path) {
+                  return Identifier.fromNamespaceAndPath(MOD_ID, path);
+              }
+
+              @Override
+              public void onInitialize() {
+                  PayloadTypeRegistry.clientboundPlay().register(OpenWolfMenuPayload.TYPE, OpenWolfMenuPayload.CODEC);
+                  PayloadTypeRegistry.serverboundPlay().register(WolfSettingsPayload.TYPE, WolfSettingsPayload.CODEC);
+                  PayloadTypeRegistry.serverboundPlay().register(UntameWolfPayload.TYPE, UntameWolfPayload.CODEC);
+
+                  WolfTaming.register();
+              }
+          }
+          WOLFPLUS_EOF
+          mkdir -p 'src/main/java/com/wolfplus'
+          cat > 'src/main/java/com/wolfplus/WolfTaming.java' <<'WOLFPLUS_EOF'
+          package com.wolfplus;
+
+          import com.wolfplus.mixin.WolfAccess;
+          import com.wolfplus.net.OpenWolfMenuPayload;
+          import com.wolfplus.net.UntameWolfPayload;
+          import com.wolfplus.net.WolfSettingsPayload;
+          import java.util.HashMap;
+          import java.util.Map;
+          import java.util.Set;
+          import java.util.UUID;
+          import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
+          import net.fabricmc.fabric.api.event.player.UseEntityCallback;
+          import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
+          import net.minecraft.network.chat.Component;
+          import net.minecraft.server.level.ServerPlayer;
+          import net.minecraft.world.InteractionHand;
+          import net.minecraft.world.InteractionResult;
+          import net.minecraft.world.entity.Entity;
+          import net.minecraft.world.entity.animal.wolf.Wolf;
+          import net.minecraft.world.entity.player.Player;
+          import net.minecraft.world.item.DyeColor;
+          import net.minecraft.world.item.Item;
+          import net.minecraft.world.item.ItemStack;
+          import net.minecraft.world.item.Items;
+          import net.minecraft.world.level.Level;
+          import net.minecraft.world.phys.EntityHitResult;
+
+          /**
+           * Вся серверная логика мода.
+           *
+           * Приручение работает через "очки приручения" (нужно набрать {@link #NEEDED}):
+           *  - кость даёт 5 или 10 очков  -> приручение за 1-2 кости, гарантированно не больше 2;
+           *  - кусок мяса даёт 2-4 очка   -> приручение за 3-5 кусков, гарантированно не больше 5;
+           *  - смешанное кормление тоже суммируется.
+           */
+          public final class WolfTaming {
+              private static final int NEEDED = 10;
+              private static final double MAX_DISTANCE_SQ = 10.0 * 10.0;
+
+              /** Прогресс приручения диких волков. Сбрасывается при остановке сервера. */
+              private static final Map<UUID, Integer> PROGRESS = new HashMap<>();
+
+              /** Любое мясо (плюс всё, что ванилла считает едой для волка). */
+              private static final Set<Item> MEAT = Set.of(
+                      Items.BEEF, Items.COOKED_BEEF,
+                      Items.PORKCHOP, Items.COOKED_PORKCHOP,
+                      Items.CHICKEN, Items.COOKED_CHICKEN,
+                      Items.MUTTON, Items.COOKED_MUTTON,
+                      Items.RABBIT, Items.COOKED_RABBIT,
+                      Items.ROTTEN_FLESH);
+
+              private WolfTaming() {
+              }
+
+              public static void register() {
+                  UseEntityCallback.EVENT.register(WolfTaming::onUse);
+                  ServerLifecycleEvents.SERVER_STOPPED.register(server -> PROGRESS.clear());
+
+                  ServerPlayNetworking.registerGlobalReceiver(WolfSettingsPayload.TYPE, (payload, context) -> {
+                      Wolf wolf = findOwnedWolf(context.player(), payload.entityId());
+                      if (wolf != null) {
+                          applySettings(wolf, payload);
+                      }
+                  });
+
+                  ServerPlayNetworking.registerGlobalReceiver(UntameWolfPayload.TYPE, (payload, context) -> {
+                      Wolf wolf = findOwnedWolf(context.player(), payload.entityId());
+                      if (wolf != null) {
+                          untame(wolf);
+                      }
+                  });
+              }
+
+              // ---------------------------------------------------------------- взаимодействие
+
+              private static InteractionResult onUse(Player player, Level level, InteractionHand hand, Entity entity,
+                      EntityHitResult hitResult) {
+                  if (!(entity instanceof Wolf wolf) || player.isSpectator()) {
+                      return InteractionResult.PASS;
+                  }
+
+                  boolean client = level.isClientSide();
+                  InteractionResult handled = client ? InteractionResult.SUCCESS : InteractionResult.SUCCESS_SERVER;
+                  ItemStack stack = player.getItemInHand(hand);
+
+                  if (wolf.isTame()) {
+                      // Shift + ПКМ пустой рукой по своему волку -> меню настройки / расприручения
+                      if (hand == InteractionHand.MAIN_HAND && stack.isEmpty() && player.isShiftKeyDown()
+                              && wolf.isOwnedBy(player)) {
+                          if (!client && player instanceof ServerPlayer serverPlayer) {
+                              openMenu(serverPlayer, wolf, false);
+                          }
+                          return handled;
+                      }
+                      return InteractionResult.PASS; // всё остальное - как в ванилле
+                  }
+
+                  // Дикий волк: кость или мясо
+                  boolean bone = stack.is(Items.BONE);
+                  if (!bone && !isMeat(wolf, stack)) {
+                      return InteractionResult.PASS;
+                  }
+                  if (wolf.getRemainingPersistentAngerTime() > 0) {
+                      return InteractionResult.PASS; // злого волка так не приручить
+                  }
+
+                  if (!client && player instanceof ServerPlayer serverPlayer) {
+                      feed(serverPlayer, wolf, stack, bone);
+                  }
+                  return handled;
+              }
+
+              private static boolean isMeat(Wolf wolf, ItemStack stack) {
+                  return !stack.isEmpty() && (MEAT.contains(stack.getItem()) || wolf.isFood(stack));
+              }
+
+              private static void feed(ServerPlayer player, Wolf wolf, ItemStack stack, boolean bone) {
+                  var random = wolf.getRandom();
+                  stack.consume(1, player);
+
+                  int gain = bone ? (random.nextBoolean() ? 5 : 10) : 2 + random.nextInt(3);
+                  int total = PROGRESS.merge(wolf.getUUID(), gain, Integer::sum);
+                  Level level = wolf.level();
+
+                  if (total >= NEEDED) {
+                      PROGRESS.remove(wolf.getUUID());
+                      wolf.tame(player);
+                      wolf.getNavigation().stop();
+                      wolf.setTarget(null);
+                      wolf.setOrderedToSit(true);
+                      level.broadcastEntityEvent(wolf, (byte) 7); // сердечки
+                      openMenu(player, wolf, true);
+                  } else {
+                      level.broadcastEntityEvent(wolf, (byte) 6); // дымок: пока не вышло
+                  }
+              }
+
+              // ---------------------------------------------------------------- меню
+
+              private static void openMenu(ServerPlayer player, Wolf wolf, boolean firstTime) {
+                  String name = wolf.hasCustomName() ? wolf.getCustomName().getString() : "";
+                  ServerPlayNetworking.send(player, new OpenWolfMenuPayload(
+                          wolf.getId(),
+                          firstTime,
+                          name,
+                          WolfOptions.variantIndexOf(wolf),
+                          wolf.getCollarColor().getId()));
+              }
+
+              /** Волк, который существует, приручён, принадлежит игроку и находится рядом. Иначе null. */
+              private static Wolf findOwnedWolf(ServerPlayer player, int entityId) {
+                  Entity entity = player.level().getEntity(entityId);
+                  if (entity instanceof Wolf wolf
+                          && wolf.isTame()
+                          && wolf.isOwnedBy(player)
+                          && wolf.distanceToSqr(player) <= MAX_DISTANCE_SQ) {
+                      return wolf;
+                  }
+                  return null;
+              }
+
+              private static void applySettings(Wolf wolf, WolfSettingsPayload payload) {
+                  String name = payload.name().strip();
+                  if (name.length() > WolfOptions.MAX_NAME_LENGTH) {
+                      name = name.substring(0, WolfOptions.MAX_NAME_LENGTH);
+                  }
+                  wolf.setCustomName(name.isEmpty() ? null : Component.literal(name));
+
+                  WolfOptions.applyVariant(wolf, payload.variantIndex());
+
+                  DyeColor color = DyeColor.byId(payload.colorId());
+                  ((WolfAccess) wolf).wolfplus$setCollarColor(color);
+              }
+
+              // ---------------------------------------------------------------- расприручение
+
+              private static void untame(Wolf wolf) {
+                  wolf.setOrderedToSit(false);
+                  wolf.setInSittingPose(false);
+                  wolf.setOwnerReference(null);
+                  wolf.setTame(false, true);
+                  wolf.setCustomName(null);
+                  wolf.setTarget(null);
+                  wolf.getNavigation().stop();
+                  wolf.level().broadcastEntityEvent(wolf, (byte) 6);
+              }
+          }
+          WOLFPLUS_EOF
+          mkdir -p 'src/main/java/com/wolfplus/mixin'
+          cat > 'src/main/java/com/wolfplus/mixin/WolfAccess.java' <<'WOLFPLUS_EOF'
+          package com.wolfplus.mixin;
+
+          import net.minecraft.core.Holder;
+          import net.minecraft.world.entity.animal.wolf.Wolf;
+          import net.minecraft.world.entity.animal.wolf.WolfVariant;
+          import net.minecraft.world.item.DyeColor;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.gen.Invoker;
+
+          /**
+           * Открывает приватные методы Wolf, которыми ванилла меняет породу и цвет ошейника.
+           */
+          @Mixin(Wolf.class)
+          public interface WolfAccess {
+              @Invoker("getVariant")
+              Holder<WolfVariant> wolfplus$getVariant();
+
+              @Invoker("setVariant")
+              void wolfplus$setVariant(Holder<WolfVariant> variant);
+
+              @Invoker("setCollarColor")
+              void wolfplus$setCollarColor(DyeColor color);
+          }
+          WOLFPLUS_EOF
+          mkdir -p 'src/main/java/com/wolfplus/net'
+          cat > 'src/main/java/com/wolfplus/net/OpenWolfMenuPayload.java' <<'WOLFPLUS_EOF'
+          package com.wolfplus.net;
+
+          import com.wolfplus.WolfPlus;
+          import net.minecraft.network.RegistryFriendlyByteBuf;
+          import net.minecraft.network.codec.ByteBufCodecs;
+          import net.minecraft.network.codec.StreamCodec;
+          import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
+
+          /**
+           * Сервер -> клиент: открыть меню настройки волка.
+           *
+           * @param firstTime    true, если волка только что приручили
+           * @param name         текущее имя ("" если без имени)
+           * @param variantIndex индекс породы в {@link com.wolfplus.WolfOptions#VARIANTS}
+           * @param colorId      id цвета ошейника (DyeColor#getId)
+           */
+          public record OpenWolfMenuPayload(int entityId, boolean firstTime, String name, int variantIndex, int colorId)
+                  implements CustomPacketPayload {
+
+              public static final CustomPacketPayload.Type<OpenWolfMenuPayload> TYPE =
+                      new CustomPacketPayload.Type<>(WolfPlus.id("open_menu"));
+
+              public static final StreamCodec<RegistryFriendlyByteBuf, OpenWolfMenuPayload> CODEC = StreamCodec.composite(
+                      ByteBufCodecs.VAR_INT, OpenWolfMenuPayload::entityId,
+                      ByteBufCodecs.BOOL, OpenWolfMenuPayload::firstTime,
+                      ByteBufCodecs.STRING_UTF8, OpenWolfMenuPayload::name,
+                      ByteBufCodecs.VAR_INT, OpenWolfMenuPayload::variantIndex,
+                      ByteBufCodecs.VAR_INT, OpenWolfMenuPayload::colorId,
+                      OpenWolfMenuPayload::new);
+
+              @Override
+              public CustomPacketPayload.Type<? extends CustomPacketPayload> type() {
+                  return TYPE;
+              }
+          }
+          WOLFPLUS_EOF
+          mkdir -p 'src/main/java/com/wolfplus/net'
+          cat > 'src/main/java/com/wolfplus/net/UntameWolfPayload.java' <<'WOLFPLUS_EOF'
+          package com.wolfplus.net;
+
+          import com.wolfplus.WolfPlus;
+          import net.minecraft.network.RegistryFriendlyByteBuf;
+          import net.minecraft.network.codec.ByteBufCodecs;
+          import net.minecraft.network.codec.StreamCodec;
+          import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
+
+          /** Клиент -> сервер: расприручить волка (отправляется только после двух подтверждений в GUI). */
+          public record UntameWolfPayload(int entityId) implements CustomPacketPayload {
+
+              public static final CustomPacketPayload.Type<UntameWolfPayload> TYPE =
+                      new CustomPacketPayload.Type<>(WolfPlus.id("untame_wolf"));
+
+              public static final StreamCodec<RegistryFriendlyByteBuf, UntameWolfPayload> CODEC = StreamCodec.composite(
+                      ByteBufCodecs.VAR_INT, UntameWolfPayload::entityId,
+                      UntameWolfPayload::new);
+
+              @Override
+              public CustomPacketPayload.Type<? extends CustomPacketPayload> type() {
+                  return TYPE;
+              }
+          }
+          WOLFPLUS_EOF
+          mkdir -p 'src/main/java/com/wolfplus/net'
+          cat > 'src/main/java/com/wolfplus/net/WolfSettingsPayload.java' <<'WOLFPLUS_EOF'
+          package com.wolfplus.net;
+
+          import com.wolfplus.WolfPlus;
+          import net.minecraft.network.RegistryFriendlyByteBuf;
+          import net.minecraft.network.codec.ByteBufCodecs;
+          import net.minecraft.network.codec.StreamCodec;
+          import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
+
+          /** Клиент -> сервер: применить имя, породу и цвет ошейника. */
+          public record WolfSettingsPayload(int entityId, String name, int variantIndex, int colorId)
+                  implements CustomPacketPayload {
+
+              public static final CustomPacketPayload.Type<WolfSettingsPayload> TYPE =
+                      new CustomPacketPayload.Type<>(WolfPlus.id("wolf_settings"));
+
+              public static final StreamCodec<RegistryFriendlyByteBuf, WolfSettingsPayload> CODEC = StreamCodec.composite(
+                      ByteBufCodecs.VAR_INT, WolfSettingsPayload::entityId,
+                      ByteBufCodecs.STRING_UTF8, WolfSettingsPayload::name,
+                      ByteBufCodecs.VAR_INT, WolfSettingsPayload::variantIndex,
+                      ByteBufCodecs.VAR_INT, WolfSettingsPayload::colorId,
+                      WolfSettingsPayload::new);
+
+              @Override
+              public CustomPacketPayload.Type<? extends CustomPacketPayload> type() {
+                  return TYPE;
+              }
+          }
+          WOLFPLUS_EOF
+          mkdir -p 'src/main/resources/assets/wolfplus/lang'
+          cat > 'src/main/resources/assets/wolfplus/lang/en_us.json' <<'WOLFPLUS_EOF'
+          {
+            "wolfplus.menu.title_new": "Wolf tamed! Customize it",
+            "wolfplus.menu.title": "Wolf settings",
+            "wolfplus.menu.name": "Name",
+            "wolfplus.menu.name_hint": "No name",
+            "wolfplus.menu.breed_label": "Breed",
+            "wolfplus.menu.breed": "Breed: %s",
+            "wolfplus.menu.collar_label": "Collar color",
+            "wolfplus.menu.collar": "Collar: %s",
+            "wolfplus.menu.done": "Done",
+            "wolfplus.menu.save": "Save",
+            "wolfplus.menu.skip": "Skip",
+            "wolfplus.menu.untame": "Untame wolf...",
+
+            "wolfplus.variant.pale": "Pale",
+            "wolfplus.variant.spotted": "Spotted",
+            "wolfplus.variant.snowy": "Snowy",
+            "wolfplus.variant.black": "Black",
+            "wolfplus.variant.ashen": "Ashen",
+            "wolfplus.variant.rusty": "Rusty",
+            "wolfplus.variant.woods": "Woods",
+            "wolfplus.variant.chestnut": "Chestnut",
+            "wolfplus.variant.striped": "Striped",
+
+            "wolfplus.untame.title1": "Untame this wolf?",
+            "wolfplus.untame.text1": "It will become wild again and will no longer be yours.",
+            "wolfplus.untame.yes1": "Yes, untame",
+            "wolfplus.untame.title2": "Are you absolutely sure?",
+            "wolfplus.untame.text2": "This cannot be undone. The wolf's name will be reset.",
+            "wolfplus.untame.yes2": "Untame for good",
+            "wolfplus.untame.no": "Cancel"
+          }
+          WOLFPLUS_EOF
+          mkdir -p 'src/main/resources/assets/wolfplus/lang'
+          cat > 'src/main/resources/assets/wolfplus/lang/ru_ru.json' <<'WOLFPLUS_EOF'
+          {
+            "wolfplus.menu.title_new": "Волк приручен! Настройте его",
+            "wolfplus.menu.title": "Настройки волка",
+            "wolfplus.menu.name": "Имя",
+            "wolfplus.menu.name_hint": "Без имени",
+            "wolfplus.menu.breed_label": "Порода",
+            "wolfplus.menu.breed": "Порода: %s",
+            "wolfplus.menu.collar_label": "Цвет ошейника",
+            "wolfplus.menu.collar": "Ошейник: %s",
+            "wolfplus.menu.done": "Готово",
+            "wolfplus.menu.save": "Сохранить",
+            "wolfplus.menu.skip": "Пропустить",
+            "wolfplus.menu.untame": "Расприручить волка...",
+
+            "wolfplus.variant.pale": "Бледный",
+            "wolfplus.variant.spotted": "Пятнистый",
+            "wolfplus.variant.snowy": "Снежный",
+            "wolfplus.variant.black": "Чёрный",
+            "wolfplus.variant.ashen": "Пепельный",
+            "wolfplus.variant.rusty": "Рыжий",
+            "wolfplus.variant.woods": "Лесной",
+            "wolfplus.variant.chestnut": "Каштановый",
+            "wolfplus.variant.striped": "Полосатый",
+
+            "wolfplus.untame.title1": "Расприручить волка?",
+            "wolfplus.untame.text1": "Он снова станет диким и перестанет быть вашим.",
+            "wolfplus.untame.yes1": "Да, расприручить",
+            "wolfplus.untame.title2": "Вы точно уверены?",
+            "wolfplus.untame.text2": "Это нельзя отменить. Имя волка будет сброшено.",
+            "wolfplus.untame.yes2": "Расприручить окончательно",
+            "wolfplus.untame.no": "Отмена"
+          }
+          WOLFPLUS_EOF
+          mkdir -p 'src/main/resources'
+          cat > 'src/main/resources/fabric.mod.json' <<'WOLFPLUS_EOF'
+          {
+            "schemaVersion": 1,
+            "id": "wolfplus",
+            "version": "${version}",
+            "name": "Wolf Taming+",
+            "description": "Улучшенное приручение волков: любое мясо, настройка имени, породы и ошейника, гарантированное число кормлений и возможность расприручить.",
+            "authors": [],
+            "license": "MIT",
+            "environment": "*",
+            "entrypoints": {
+              "main": [
+                "com.wolfplus.WolfPlus"
+              ],
+              "client": [
+                "com.wolfplus.client.WolfPlusClient"
+              ]
+            },
+            "mixins": [
+              "wolfplus.mixins.json"
+            ],
+            "depends": {
+              "fabricloader": ">=0.19.3",
+              "minecraft": "~26.2",
+              "java": ">=25",
+              "fabric-api": "*"
+            }
+          }
+          WOLFPLUS_EOF
+          mkdir -p 'src/main/resources'
+          cat > 'src/main/resources/wolfplus.mixins.json' <<'WOLFPLUS_EOF'
+          {
+            "required": true,
+            "package": "com.wolfplus.mixin",
+            "compatibilityLevel": "JAVA_25",
+            "mixins": [
+              "WolfAccess"
+            ],
+            "injectors": {
+              "defaultRequire": 1
+            }
+          }
+          WOLFPLUS_EOF
+
+      - name: Build
+        run: gradle build --stacktrace
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: wolfplus
+          path: |
+            build/libs/*.jar
+            !build/libs/*-sources.jar
+
+      # При пуше тега вида v1.0.0 jar прикрепляется к GitHub Release
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            build/libs/*.jar
+            !build/libs/*-sources.jar
