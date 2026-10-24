@@ -181,7 +181,8 @@ jobs:
               }
           }
           WOLFPLUS_EOF
-          mkdir -p 'src/client/java/com/wolfplus/client' cat > 'src/client/java/com/wolfplus/client/WolfMenuScreen.java' <<'WOLFPLUS_EOF'
+          mkdir -p 'src/client/java/com/wolfplus/client'
+          cat > 'src/client/java/com/wolfplus/client/WolfMenuScreen.java' <<'WOLFPLUS_EOF'
           package com.wolfplus.client;
 
           import com.wolfplus.WolfOptions;
@@ -414,7 +415,8 @@ jobs:
               }
           }
           WOLFPLUS_EOF
-          mkdir -p 'src/client/java/com/wolfplus/client' cat > 'src/client/java/com/wolfplus/client/WolfPlusClient.java' <<'WOLFPLUS_EOF'
+          mkdir -p 'src/client/java/com/wolfplus/client'
+          cat > 'src/client/java/com/wolfplus/client/WolfPlusClient.java' <<'WOLFPLUS_EOF'
           package com.wolfplus.client;
 
           import com.wolfplus.net.OpenWolfMenuPayload;
@@ -700,7 +702,8 @@ jobs:
               }
           }
           WOLFPLUS_EOF
-          mkdir -p 'src/main/java/com/wolfplus/mixin'cat > 'src/main/java/com/wolfplus/mixin/WolfAccess.java' <<'WOLFPLUS_EOF'
+          mkdir -p 'src/main/java/com/wolfplus/mixin'
+          cat > 'src/main/java/com/wolfplus/mixin/WolfAccess.java' <<'WOLFPLUS_EOF'
           package com.wolfplus.mixin;
 
           import net.minecraft.core.Holder;
