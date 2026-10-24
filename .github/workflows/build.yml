@@ -23,7 +23,7 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: 9.5.1
+          gradle-version: 9.7.0
 
       - name: Generate mod project
         run: |
@@ -35,8 +35,8 @@ jobs:
 
           # Fabric (https://fabricmc.net/develop)
           minecraft_version=26.2
-          loader_version=0.19.3
-          loom_version=1.17-SNAPSHOT
+          loader_version=0.19.5
+          loom_version=1.18.4
           fabric_api_version=0.161.0+26.2
 
           # Мод
@@ -521,8 +521,8 @@ jobs:
                   if (!bone && !isMeat(wolf, stack)) {
                       return InteractionResult.PASS;
                   }
-                  if (wolf.getRemainingPersistentAngerTime() > 0) {
-                      return InteractionResult.PASS; // злого волка так не приручить
+                  if (wolf.getTarget() == player) {
+                      return InteractionResult.PASS; // волк злится на этого игрока - так его не приручить
                   }
 
                   if (!client && player instanceof ServerPlayer serverPlayer) {
