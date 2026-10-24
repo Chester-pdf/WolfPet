@@ -181,11 +181,11 @@ jobs:
               }
           }
           WOLFPLUS_EOF
-          mkdir -p 'src/client/java/com/wolfplus/client'
-          cat > 'src/client/java/com/wolfplus/client/WolfMenuScreen.java' <<'WOLFPLUS_EOF'
+          mkdir -p 'src/client/java/com/wolfplus/client' cat > 'src/client/java/com/wolfplus/client/WolfMenuScreen.java' <<'WOLFPLUS_EOF'
           package com.wolfplus.client;
 
           import com.wolfplus.WolfOptions;
+          import com.wolfplus.mixin.WolfAccess;
           import com.wolfplus.net.OpenWolfMenuPayload;
           import com.wolfplus.net.WolfSettingsPayload;
           import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
@@ -193,12 +193,23 @@ jobs:
           import net.minecraft.client.gui.components.Button;
           import net.minecraft.client.gui.components.EditBox;
           import net.minecraft.client.gui.screens.Screen;
+          import net.minecraft.client.gui.screens.inventory.InventoryScreen;
           import net.minecraft.network.chat.Component;
+          import net.minecraft.world.entity.EntitySpawnReason;
+          import net.minecraft.world.entity.EntityType;
+          import net.minecraft.world.entity.animal.wolf.Wolf;
           import net.minecraft.world.item.DyeColor;
 
-          /** Меню настройки волка: имя, порода, цвет ошейника (+ расприручение). */
+          /** Меню настройки волка: имя, порода, цвет ошейника, 3D-превью (+ расприручение). */
           public class WolfMenuScreen extends Screen {
               private static final DyeColor[] COLORS = DyeColor.values();
+
+              /** Фиктивный ID для превью-волка: в мир он не попадает, поэтому коллизий нет. */
+              private static final int PREVIEW_ENTITY_ID = 0x7FFFFF01;
+
+              private static final int PANEL_W = 96;
+              private static final int PANEL_H = 170;
+              private static final int GAP = 8;
 
               private final int entityId;
               private final boolean firstTime;
@@ -209,6 +220,13 @@ jobs:
 
               private Button variantButton;
               private Button colorButton;
+
+              /** Клиентская копия волка только для показа модельки. */
+              private Wolf preview;
+              private float previewBase = 0.85f;
+
+              private int panelX;
+              private int panelY;
 
               public WolfMenuScreen(OpenWolfMenuPayload payload) {
                   super(Component.translatable(payload.firstTime() ? "wolfplus.menu.title_new" : "wolfplus.menu.title"));
@@ -225,11 +243,21 @@ jobs:
 
               @Override
               protected void init() {
-                  int cx = this.width / 2;
+                  int ctrlW = Math.max(140, Math.min(200, this.width - PANEL_W - GAP - 16));
+                  int total = PANEL_W + GAP + ctrlW;
+                  int left = (this.width - total) / 2;
+                  int ctrlX = left + PANEL_W + GAP;
                   int top = top();
 
+                  this.panelX = left;
+                  this.panelY = top + 14;
+
+                  if (this.preview == null) {
+                      makePreview();
+                  }
+
                   // I. Имя
-                  EditBox nameBox = new EditBox(this.font, cx - 100, top + 26, 200, 20,
+                  EditBox nameBox = new EditBox(this.font, ctrlX, top + 26, ctrlW, 20,
                           Component.translatable("wolfplus.menu.name"));
                   nameBox.setMaxLength(WolfOptions.MAX_NAME_LENGTH);
                   nameBox.setValue(this.name);
@@ -241,36 +269,71 @@ jobs:
                   // II. Порода
                   int variantY = top + 66;
                   this.addRenderableWidget(Button.builder(Component.literal("<"), b -> cycleVariant(-1))
-                          .bounds(cx - 100, variantY, 20, 20).build());
+                          .bounds(ctrlX, variantY, 20, 20).build());
                   this.variantButton = this.addRenderableWidget(Button.builder(variantLabel(), b -> cycleVariant(1))
-                          .bounds(cx - 78, variantY, 156, 20).build());
+                          .bounds(ctrlX + 22, variantY, ctrlW - 44, 20).build());
                   this.addRenderableWidget(Button.builder(Component.literal(">"), b -> cycleVariant(1))
-                          .bounds(cx + 80, variantY, 20, 20).build());
+                          .bounds(ctrlX + ctrlW - 20, variantY, 20, 20).build());
 
                   // III. Цвет ошейника
                   int colorY = top + 106;
                   this.addRenderableWidget(Button.builder(Component.literal("<"), b -> cycleColor(-1))
-                          .bounds(cx - 100, colorY, 20, 20).build());
+                          .bounds(ctrlX, colorY, 20, 20).build());
                   this.colorButton = this.addRenderableWidget(Button.builder(colorLabel(), b -> cycleColor(1))
-                          .bounds(cx - 78, colorY, 156, 20).build());
+                          .bounds(ctrlX + 22, colorY, ctrlW - 44, 20).build());
                   this.addRenderableWidget(Button.builder(Component.literal(">"), b -> cycleColor(1))
-                          .bounds(cx + 80, colorY, 20, 20).build());
+                          .bounds(ctrlX + ctrlW - 20, colorY, 20, 20).build());
 
                   // Кнопки
                   this.addRenderableWidget(Button.builder(
                                   Component.translatable(this.firstTime ? "wolfplus.menu.done" : "wolfplus.menu.save"),
                                   b -> save())
-                          .bounds(cx - 100, top + 140, 200, 20).build());
+                          .bounds(ctrlX, top + 140, ctrlW, 20).build());
 
                   if (this.firstTime) {
                       this.addRenderableWidget(Button.builder(Component.translatable("wolfplus.menu.skip"), b -> this.onClose())
-                              .bounds(cx - 100, top + 164, 200, 20).build());
+                              .bounds(ctrlX, top + 164, ctrlW, 20).build());
                   } else {
                       this.addRenderableWidget(Button.builder(Component.translatable("wolfplus.menu.untame"),
                                       b -> this.minecraft.gui.setScreen(new UntameConfirmScreen(this, this.entityId, 1)))
-                              .bounds(cx - 100, top + 164, 200, 20).build());
+                              .bounds(ctrlX, top + 164, ctrlW, 20).build());
                   }
               }
+
+              // ------------------------------------------------------------ превью
+
+              /** Создаёт клиентскую копию волка (в мир она не добавляется) и применяет текущие настройки. */
+              private void makePreview() {
+                  this.preview = null;
+                  if (this.minecraft == null || this.minecraft.level == null) {
+                      return;
+                  }
+                  try {
+                      Wolf wolf = EntityType.WOLF.create(this.minecraft.level, EntitySpawnReason.LOAD);
+                      if (wolf == null) {
+                          return;
+                      }
+                      // Моб вне мира не имеет ID, а рендерер его требует - выдаём фиктивный.
+                      wolf.setId(PREVIEW_ENTITY_ID);
+                      wolf.setTame(true, false);        // ошейник рисуется только у прирученного
+                      wolf.setInSittingPose(true);      // сидит, как только что приручённый
+                      this.previewBase = Math.max(wolf.getBbHeight(), wolf.getBbWidth() * 0.9f);
+                      this.preview = wolf;
+                      updatePreview();
+                  } catch (Throwable ex) {
+                      this.preview = null;
+                  }
+              }
+
+              private void updatePreview() {
+                  if (this.preview == null) {
+                      return;
+                  }
+                  WolfOptions.applyVariant(this.preview, this.variant);
+                  ((WolfAccess) this.preview).wolfplus$setCollarColor(COLORS[this.color]);
+              }
+
+              // ------------------------------------------------------------ подписи и кнопки
 
               private Component variantLabel() {
                   return Component.translatable("wolfplus.menu.breed",
@@ -287,11 +350,13 @@ jobs:
               private void cycleVariant(int step) {
                   this.variant = Math.floorMod(this.variant + step, WolfOptions.VARIANTS.size());
                   this.variantButton.setMessage(variantLabel());
+                  updatePreview();
               }
 
               private void cycleColor(int step) {
                   this.color = Math.floorMod(this.color + step, COLORS.length);
                   this.colorButton.setMessage(colorLabel());
+                  updatePreview();
               }
 
               private void save() {
@@ -299,16 +364,45 @@ jobs:
                   this.onClose();
               }
 
+              // ------------------------------------------------------------ отрисовка
+
               @Override
               public void extractRenderState(GuiGraphicsExtractor graphics, int mouseX, int mouseY, float delta) {
                   super.extractRenderState(graphics, mouseX, mouseY, delta);
 
-                  int cx = this.width / 2;
+                  int ctrlW = Math.max(140, Math.min(200, this.width - PANEL_W - GAP - 16));
+                  int total = PANEL_W + GAP + ctrlW;
+                  int left = (this.width - total) / 2;
+                  int ctrlX = left + PANEL_W + GAP;
                   int top = top();
-                  drawCentered(graphics, this.title.getString(), cx, top, 0xFFFFFFFF);
-                  drawLabel(graphics, Component.translatable("wolfplus.menu.name").getString(), cx - 100, top + 14);
-                  drawLabel(graphics, Component.translatable("wolfplus.menu.breed_label").getString(), cx - 100, top + 54);
-                  drawLabel(graphics, Component.translatable("wolfplus.menu.collar_label").getString(), cx - 100, top + 94);
+
+                  drawCentered(graphics, this.title.getString(), left + total / 2, top, 0xFFFFFFFF);
+                  drawLabel(graphics, Component.translatable("wolfplus.menu.name").getString(), ctrlX, top + 14);
+                  drawLabel(graphics, Component.translatable("wolfplus.menu.breed_label").getString(), ctrlX, top + 54);
+                  drawLabel(graphics, Component.translatable("wolfplus.menu.collar_label").getString(), ctrlX, top + 94);
+
+                  // Тёмная панель под моделькой.
+                  graphics.fill(this.panelX, this.panelY, this.panelX + PANEL_W, this.panelY + PANEL_H, 0xCC101010);
+                  graphics.nextStratum();
+
+                  // Моделька следит за курсором, как в инвентаре.
+                  if (this.preview != null) {
+                      int modelBottom = this.panelY + PANEL_H - 16;
+                      int modelH = modelBottom - this.panelY;
+                      int scale = (int) Math.max(2.0, Math.min(200.0, modelH * 0.55 / this.previewBase));
+                      InventoryScreen.extractEntityInInventoryFollowsMouse(graphics,
+                              this.panelX, this.panelY, this.panelX + PANEL_W, modelBottom,
+                              scale, 0.0625f, (float) mouseX, (float) mouseY, this.preview);
+                  }
+
+                  // Подпись под моделькой: имя, а если его нет - порода.
+                  String caption = this.name.isBlank()
+                          ? Component.translatable("wolfplus.variant." + WolfOptions.VARIANTS.get(this.variant)).getString()
+                          : this.name.strip();
+                  while (caption.length() > 1 && this.font.width(caption) > PANEL_W - 6) {
+                      caption = caption.substring(0, caption.length() - 1);
+                  }
+                  drawCentered(graphics, caption, this.panelX + PANEL_W / 2, this.panelY + PANEL_H - 12, 0xFFFFFFFF);
               }
 
               private void drawCentered(GuiGraphicsExtractor graphics, String text, int centerX, int y, int color) {
@@ -320,8 +414,7 @@ jobs:
               }
           }
           WOLFPLUS_EOF
-          mkdir -p 'src/client/java/com/wolfplus/client'
-          cat > 'src/client/java/com/wolfplus/client/WolfPlusClient.java' <<'WOLFPLUS_EOF'
+          mkdir -p 'src/client/java/com/wolfplus/client' cat > 'src/client/java/com/wolfplus/client/WolfPlusClient.java' <<'WOLFPLUS_EOF'
           package com.wolfplus.client;
 
           import com.wolfplus.net.OpenWolfMenuPayload;
@@ -607,8 +700,7 @@ jobs:
               }
           }
           WOLFPLUS_EOF
-          mkdir -p 'src/main/java/com/wolfplus/mixin'
-          cat > 'src/main/java/com/wolfplus/mixin/WolfAccess.java' <<'WOLFPLUS_EOF'
+          mkdir -p 'src/main/java/com/wolfplus/mixin'cat > 'src/main/java/com/wolfplus/mixin/WolfAccess.java' <<'WOLFPLUS_EOF'
           package com.wolfplus.mixin;
 
           import net.minecraft.core.Holder;
