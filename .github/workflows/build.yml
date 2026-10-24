@@ -195,7 +195,9 @@ jobs:
           import net.minecraft.client.gui.components.EditBox;
           import net.minecraft.client.gui.screens.Screen;
           import net.minecraft.client.gui.screens.inventory.InventoryScreen;
+          import net.minecraft.core.registries.BuiltInRegistries;
           import net.minecraft.network.chat.Component;
+          import net.minecraft.world.entity.Entity;
           import net.minecraft.world.entity.EntitySpawnReason;
           import net.minecraft.world.entity.EntityType;
           import net.minecraft.world.entity.animal.wolf.Wolf;
@@ -310,8 +312,19 @@ jobs:
                       return;
                   }
                   try {
-                      Wolf wolf = EntityType.WOLF.create(this.minecraft.level, EntitySpawnReason.LOAD);
-                      if (wolf == null) {
+                      // В 26.2 константы EntityType.WOLF нет - ищем тип волка в реестре.
+                      EntityType<?> wolfType = null;
+                      for (EntityType<?> type : BuiltInRegistries.ENTITY_TYPE) {
+                          if (BuiltInRegistries.ENTITY_TYPE.getKey(type).toString().equals("minecraft:wolf")) {
+                              wolfType = type;
+                              break;
+                          }
+                      }
+                      if (wolfType == null) {
+                          return;
+                      }
+                      Entity created = wolfType.create(this.minecraft.level, EntitySpawnReason.LOAD);
+                      if (!(created instanceof Wolf wolf)) {
                           return;
                       }
                       // Моб вне мира не имеет ID, а рендерер его требует - выдаём фиктивный.
