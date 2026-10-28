@@ -40,7 +40,7 @@ jobs:
           fabric_api_version=0.161.0+26.2
 
           # Мод
-          mod_version=1.1.0
+          mod_version=1.2.0
           maven_group=com.wolfplus
           archives_base_name=wolfplus
           WOLFPLUS_EOF
@@ -432,8 +432,10 @@ jobs:
           cat > 'src/client/java/com/wolfplus/client/WolfPlusClient.java' <<'WOLFPLUS_EOF'
           package com.wolfplus.client;
 
+          import com.wolfplus.WolfFlightHooks;
           import com.wolfplus.net.MountWolfPayload;
           import com.wolfplus.net.OpenWolfMenuPayload;
+          import com.wolfplus.net.WolfFlightPayload;
           import net.fabricmc.api.ClientModInitializer;
           import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
           import net.fabricmc.fabric.api.event.player.AttackEntityCallback;
@@ -445,6 +447,9 @@ jobs:
               public void onInitializeClient() {
                   ClientPlayNetworking.registerGlobalReceiver(OpenWolfMenuPayload.TYPE, (payload, context) ->
                           context.client().gui.setScreen(new WolfMenuScreen(payload)));
+
+                  // Двойной прыжок на волке (детект в WolfRideMixin) -> пакет переключения полёта.
+                  WolfFlightHooks.CLIENT_TOGGLE = entityId -> ClientPlayNetworking.send(new WolfFlightPayload(entityId));
 
                   // Shift + удар по своему волку -> запрос на посадку верхом.
                   // Событие на клиенте отменяет сам удар (пакет атаки на сервер не уходит),
@@ -526,6 +531,7 @@ jobs:
           import com.wolfplus.net.MountWolfPayload;
           import com.wolfplus.net.OpenWolfMenuPayload;
           import com.wolfplus.net.UntameWolfPayload;
+          import com.wolfplus.net.WolfFlightPayload;
           import com.wolfplus.net.WolfSettingsPayload;
           import net.fabricmc.api.ModInitializer;
           import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
@@ -544,6 +550,7 @@ jobs:
                   PayloadTypeRegistry.serverboundPlay().register(WolfSettingsPayload.TYPE, WolfSettingsPayload.CODEC);
                   PayloadTypeRegistry.serverboundPlay().register(UntameWolfPayload.TYPE, UntameWolfPayload.CODEC);
                   PayloadTypeRegistry.serverboundPlay().register(MountWolfPayload.TYPE, MountWolfPayload.CODEC);
+                  PayloadTypeRegistry.serverboundPlay().register(WolfFlightPayload.TYPE, WolfFlightPayload.CODEC);
 
                   WolfTaming.register();
               }
@@ -553,28 +560,33 @@ jobs:
           cat > 'src/main/java/com/wolfplus/WolfTaming.java' <<'WOLFPLUS_EOF'
           package com.wolfplus;
 
-          import com.wolfplus.mixin.MobAccess;
           import com.wolfplus.mixin.WolfAccess;
           import com.wolfplus.net.MountWolfPayload;
           import com.wolfplus.net.OpenWolfMenuPayload;
           import com.wolfplus.net.UntameWolfPayload;
+          import com.wolfplus.net.WolfFlightPayload;
           import com.wolfplus.net.WolfSettingsPayload;
           import java.util.HashMap;
           import java.util.Iterator;
           import java.util.Map;
           import java.util.Set;
           import java.util.UUID;
+          import net.fabricmc.fabric.api.event.lifecycle.v1.ServerEntityEvents;
           import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
           import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
           import net.fabricmc.fabric.api.event.player.UseEntityCallback;
           import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
           import net.minecraft.network.chat.Component;
           import net.minecraft.server.MinecraftServer;
+          import net.minecraft.server.level.ServerLevel;
           import net.minecraft.server.level.ServerPlayer;
           import net.minecraft.world.InteractionHand;
           import net.minecraft.world.InteractionResult;
+          import net.minecraft.world.effect.MobEffectInstance;
+          import net.minecraft.world.effect.MobEffects;
           import net.minecraft.world.entity.Entity;
           import net.minecraft.world.entity.EquipmentSlot;
+          import net.minecraft.world.entity.LivingEntity;
           import net.minecraft.world.entity.animal.wolf.Wolf;
           import net.minecraft.world.entity.player.Player;
           import net.minecraft.world.item.DyeColor;
@@ -595,8 +607,10 @@ jobs:
            * Верховая езда:
            *  - Shift + удар по своему волку -> посадка (срабатывает, когда игрок отпустит Shift,
            *    иначе игру сразу бы ссадило: Shift = слезть);
-           *  - седло надевается ПКМ, снимается ножницами (как у остальных сёдел);
-           *  - без седла волк идёт сам, с седлом - им управляет игрок (логика в WolfRideMixin).
+           *  - седло надевается ПКМ, элитры тоже ПКМ; ножницы снимают седло, Shift + ножницы - элитры;
+           *  - без седла волк идёт сам, с седлом - им управляет игрок (логика в WolfRideMixin);
+           *  - двойное нажатие прыжка верхом (седло + элитры) включает/выключает полёт.
+           *    Режим полёта = noGravity у волка; сервер следит за ним в {@link #tickFlights}.
            */
           public final class WolfTaming {
               private static final int NEEDED = 10;
@@ -610,6 +624,9 @@ jobs:
 
               /** Ожидающие посадки: игрок -> волк. */
               private static final Map<UUID, PendingMount> PENDING_MOUNTS = new HashMap<>();
+
+              /** Летящие волки (по UUID волка). */
+              private static final Map<UUID, FlightState> FLIGHTS = new HashMap<>();
 
               /** Любое мясо (плюс всё, что ванилла считает едой для волка). */
               private static final Set<Item> MEAT = Set.of(
@@ -629,15 +646,30 @@ jobs:
                   }
               }
 
+              private static final class FlightState {
+                  int ticks;
+              }
+
               private WolfTaming() {
               }
 
               public static void register() {
                   UseEntityCallback.EVENT.register(WolfTaming::onUse);
-                  ServerTickEvents.END_SERVER_TICK.register(WolfTaming::tickPendingMounts);
+                  ServerTickEvents.END_SERVER_TICK.register(server -> {
+                      tickPendingMounts(server);
+                      tickFlights(server);
+                  });
                   ServerLifecycleEvents.SERVER_STOPPED.register(server -> {
                       PROGRESS.clear();
                       PENDING_MOUNTS.clear();
+                      FLIGHTS.clear();
+                  });
+
+                  // Волк, сохранённый в полёте (noGravity), после загрузки не должен висеть в воздухе.
+                  ServerEntityEvents.ENTITY_LOAD.register((entity, world) -> {
+                      if (entity instanceof Wolf wolf && wolf.isNoGravity() && !FLIGHTS.containsKey(wolf.getUUID())) {
+                          wolf.setNoGravity(false);
+                      }
                   });
 
                   ServerPlayNetworking.registerGlobalReceiver(WolfSettingsPayload.TYPE, (payload, context) -> {
@@ -661,6 +693,9 @@ jobs:
                           PENDING_MOUNTS.put(player.getUUID(), new PendingMount(wolf.getId()));
                       }
                   });
+
+                  ServerPlayNetworking.registerGlobalReceiver(WolfFlightPayload.TYPE, (payload, context) ->
+                          toggleFlight(context.player(), payload.entityId()));
               }
 
               // ---------------------------------------------------------------- взаимодействие
@@ -677,25 +712,34 @@ jobs:
 
                   if (wolf.isTame()) {
                       if (wolf.isOwnedBy(player)) {
-                          // Седло: ПКМ седлом по своему волку (взрослому)
-                          if (stack.is(Items.SADDLE) && !hasSaddle(wolf) && !wolf.isBaby()) {
-                              if (!client) {
-                                  ((MobAccess) wolf).wolfplus$setItemSlotAndDropWhenKilled(
-                                          EquipmentSlot.SADDLE, stack.copyWithCount(1));
-                                  stack.consume(1, player);
+                          // Надеть седло / элитры (взрослому волку)
+                          if (!wolf.isBaby()) {
+                              EquipmentSlot slot = null;
+                              if (stack.is(Items.SADDLE)) {
+                                  slot = EquipmentSlot.SADDLE;
+                              } else if (stack.is(Items.ELYTRA)) {
+                                  slot = EquipmentSlot.CHEST;
                               }
-                              return handled;
+                              if (slot != null && !hasGear(wolf, slot)) {
+                                  if (!client) {
+                                      wolf.setItemSlotAndDropWhenKilled(slot, stack.copyWithCount(1));
+                                      stack.consume(1, player);
+                                  }
+                                  return handled;
+                              }
                           }
-                          // Снять седло: ножницы (как у других ездовых)
-                          if (stack.is(Items.SHEARS) && hasSaddle(wolf)) {
-                              if (!client) {
-                                  ItemStack saddle = wolf.getItemBySlot(EquipmentSlot.SADDLE).copy();
-                                  wolf.setItemSlot(EquipmentSlot.SADDLE, ItemStack.EMPTY);
-                                  giveOrDrop(player, saddle);
-                                  stack.hurtAndBreak(1, player,
-                                          hand == InteractionHand.MAIN_HAND ? EquipmentSlot.MAINHAND : EquipmentSlot.OFFHAND);
+                          // Снять: ножницы -> седло, Shift + ножницы -> элитры
+                          if (stack.is(Items.SHEARS)) {
+                              EquipmentSlot slot = player.isShiftKeyDown() ? EquipmentSlot.CHEST : EquipmentSlot.SADDLE;
+                              if (hasGear(wolf, slot)) {
+                                  if (!client) {
+                                      ItemStack gear = wolf.getItemBySlot(slot).copy();
+                                      wolf.setItemSlot(slot, ItemStack.EMPTY);
+                                      giveOrDrop(player, gear);
+                                      stack.hurtAndBreak(1, player, LivingEntity.getSlotForHand(hand));
+                                  }
+                                  return handled;
                               }
-                              return handled;
                           }
                       }
 
@@ -750,10 +794,15 @@ jobs:
                   }
               }
 
-              // ---------------------------------------------------------------- верховая езда
+              // ---------------------------------------------------------------- снаряжение
 
-              private static boolean hasSaddle(Wolf wolf) {
-                  return !wolf.getItemBySlot(EquipmentSlot.SADDLE).isEmpty();
+              private static boolean hasGear(Wolf wolf, EquipmentSlot slot) {
+                  return !wolf.getItemBySlot(slot).isEmpty();
+              }
+
+              private static boolean elytraUsable(Wolf wolf) {
+                  ItemStack elytra = wolf.getItemBySlot(EquipmentSlot.CHEST);
+                  return elytra.is(Items.ELYTRA) && elytra.getMaxDamage() - elytra.getDamageValue() > 1;
               }
 
               private static void giveOrDrop(Player player, ItemStack stack) {
@@ -761,6 +810,8 @@ jobs:
                       player.drop(stack, false);
                   }
               }
+
+              // ---------------------------------------------------------------- верховая езда
 
               /**
                * Садим игрока на волка, как только он отпустит Shift
@@ -792,6 +843,84 @@ jobs:
                           player.startRiding(wolf);
                       }
                       it.remove();
+                  }
+              }
+
+              // ---------------------------------------------------------------- полёт
+
+              /** Двойной прыжок на волке: включить или выключить полёт. */
+              private static void toggleFlight(ServerPlayer player, int entityId) {
+                  Entity entity = player.level().getEntity(entityId);
+                  if (!(entity instanceof Wolf wolf)
+                          || player.getVehicle() != wolf
+                          || !wolf.isOwnedBy(player)
+                          || !hasGear(wolf, EquipmentSlot.SADDLE)) {
+                      return;
+                  }
+                  if (FLIGHTS.containsKey(wolf.getUUID())) {
+                      FLIGHTS.remove(wolf.getUUID());
+                      stopFlight(wolf);
+                      return;
+                  }
+                  if (!elytraUsable(wolf)) {
+                      return;
+                  }
+                  FLIGHTS.put(wolf.getUUID(), new FlightState());
+                  wolf.setNoGravity(true);
+                  wolf.resetFallDistance();
+              }
+
+              private static void stopFlight(Wolf wolf) {
+                  wolf.setNoGravity(false);
+                  wolf.resetFallDistance();
+                  if (!wolf.onGround()) {
+                      // Мягкая посадка, если выключили полёт в воздухе.
+                      wolf.addEffect(new MobEffectInstance(MobEffects.SLOW_FALLING, 80, 0, false, false));
+                  }
+              }
+
+              private static Wolf findWolf(MinecraftServer server, UUID uuid) {
+                  for (ServerLevel level : server.getAllLevels()) {
+                      if (level.getEntity(uuid) instanceof Wolf wolf) {
+                          return wolf;
+                      }
+                  }
+                  return null;
+              }
+
+              private static void tickFlights(MinecraftServer server) {
+                  if (FLIGHTS.isEmpty()) {
+                      return;
+                  }
+                  Iterator<Map.Entry<UUID, FlightState>> it = FLIGHTS.entrySet().iterator();
+                  while (it.hasNext()) {
+                      Map.Entry<UUID, FlightState> entry = it.next();
+                      FlightState state = entry.getValue();
+                      Wolf wolf = findWolf(server, entry.getKey());
+                      if (wolf == null) {
+                          it.remove();
+                          continue;
+                      }
+
+                      state.ticks++;
+                      boolean ok = wolf.isAlive()
+                              && hasGear(wolf, EquipmentSlot.SADDLE)
+                              && elytraUsable(wolf)
+                              && wolf.getControllingPassenger() instanceof ServerPlayer;
+                      if (ok && state.ticks > 10 && wolf.onGround()) {
+                          ok = false; // приземлились
+                      }
+                      if (!ok) {
+                          it.remove();
+                          stopFlight(wolf);
+                          continue;
+                      }
+
+                      wolf.resetFallDistance();
+                      if (state.ticks % 20 == 0) {
+                          // Элитры изнашиваются, как у игрока: 1 прочность в секунду.
+                          wolf.getItemBySlot(EquipmentSlot.CHEST).hurtAndBreak(1, wolf, EquipmentSlot.CHEST);
+                      }
                   }
               }
 
@@ -835,13 +964,18 @@ jobs:
               // ---------------------------------------------------------------- расприручение
 
               private static void untame(Wolf wolf, ServerPlayer player) {
-                  // Ссаживаем всадника и возвращаем седло владельцу.
+                  // Останавливаем полёт, ссаживаем всадника и возвращаем седло и элитры владельцу.
+                  if (FLIGHTS.remove(wolf.getUUID()) != null) {
+                      wolf.setNoGravity(false);
+                  }
                   wolf.ejectPassengers();
-                  ItemStack saddle = wolf.getItemBySlot(EquipmentSlot.SADDLE);
-                  if (!saddle.isEmpty()) {
-                      ItemStack returned = saddle.copy();
-                      wolf.setItemSlot(EquipmentSlot.SADDLE, ItemStack.EMPTY);
-                      giveOrDrop(player, returned);
+                  for (EquipmentSlot slot : new EquipmentSlot[] {EquipmentSlot.SADDLE, EquipmentSlot.CHEST}) {
+                      ItemStack gear = wolf.getItemBySlot(slot);
+                      if (!gear.isEmpty()) {
+                          ItemStack returned = gear.copy();
+                          wolf.setItemSlot(slot, ItemStack.EMPTY);
+                          giveOrDrop(player, returned);
+                      }
                   }
 
                   wolf.setOrderedToSit(false);
@@ -853,25 +987,6 @@ jobs:
                   wolf.getNavigation().stop();
                   wolf.level().broadcastEntityEvent(wolf, (byte) 6);
               }
-          }
-          WOLFPLUS_EOF
-          mkdir -p 'src/main/java/com/wolfplus/mixin'
-          cat > 'src/main/java/com/wolfplus/mixin/MobAccess.java' <<'WOLFPLUS_EOF'
-          package com.wolfplus.mixin;
-
-          import net.minecraft.world.entity.EquipmentSlot;
-          import net.minecraft.world.entity.Mob;
-          import net.minecraft.world.item.ItemStack;
-          import org.spongepowered.asm.mixin.Mixin;
-          import org.spongepowered.asm.mixin.gen.Invoker;
-
-          /**
-           * Открывает protected-метод Mob: надеть предмет в слот так, чтобы он гарантированно выпал при смерти.
-           */
-          @Mixin(Mob.class)
-          public interface MobAccess {
-              @Invoker("setItemSlotAndDropWhenKilled")
-              void wolfplus$setItemSlotAndDropWhenKilled(EquipmentSlot slot, ItemStack stack);
           }
           WOLFPLUS_EOF
           mkdir -p 'src/main/java/com/wolfplus/mixin'
@@ -904,6 +1019,8 @@ jobs:
           cat > 'src/main/java/com/wolfplus/mixin/WolfRideMixin.java' <<'WOLFPLUS_EOF'
           package com.wolfplus.mixin;
 
+          import com.wolfplus.WolfFlightHooks;
+          import net.minecraft.tags.FluidTags;
           import net.minecraft.world.entity.EntityType;
           import net.minecraft.world.entity.EquipmentSlot;
           import net.minecraft.world.entity.LivingEntity;
@@ -911,6 +1028,7 @@ jobs:
           import net.minecraft.world.entity.ai.attributes.Attributes;
           import net.minecraft.world.entity.animal.wolf.Wolf;
           import net.minecraft.world.entity.player.Player;
+          import net.minecraft.world.item.Items;
           import net.minecraft.world.level.Level;
           import net.minecraft.world.phys.Vec3;
           import org.spongepowered.asm.mixin.Mixin;
@@ -920,11 +1038,31 @@ jobs:
            * Управление волком верхом (по образцу свиньи/лошади).
            *
            * Без седла getControllingPassenger() = null: волк живёт своей жизнью (ИИ), игрок просто едет.
-           * С седлом управляет игрок: WASD, взгляд задаёт направление, спринт ускоряет,
-           * перед препятствием в 1 блок волк прыгает сам.
+           * С седлом управляет игрок:
+           *  - WASD, взгляд задаёт направление, спринт ускоряет;
+           *  - прыжок (пробел) и автопрыжок через препятствие в 1 блок;
+           *  - в воде волк держится на поверхности и плывёт вперёд;
+           *  - двойное нажатие прыжка при надетых элитрах включает/выключает полёт
+           *    (сам режим включает сервер - noGravity; тут только физика и детект нажатий).
+           *
+           * Физика считается на клиенте всадника (как у лошади), поэтому детект пробела тоже клиентский.
            */
           @Mixin(Wolf.class)
           public abstract class WolfRideMixin extends TamableAnimal {
+              /** Начальная скорость прыжка: 0.42 = обычный прыжок игрока (~1.25 блока). */
+              @Unique
+              private static final double WOLFPLUS_JUMP_POWER = 0.52;
+
+              /** Окно двойного нажатия, тиков. */
+              @Unique
+              private static final long WOLFPLUS_DOUBLE_TAP_TICKS = 8L;
+
+              @Unique
+              private boolean wolfplus$prevJump;
+
+              @Unique
+              private long wolfplus$lastJumpPress;
+
               protected WolfRideMixin(EntityType<? extends TamableAnimal> type, Level level) {
                   super(type, level);
               }
@@ -932,6 +1070,16 @@ jobs:
               @Unique
               private boolean wolfplus$isSaddled() {
                   return !this.getItemBySlot(EquipmentSlot.SADDLE).isEmpty();
+              }
+
+              @Unique
+              private boolean wolfplus$hasElytra() {
+                  return this.getItemBySlot(EquipmentSlot.CHEST).is(Items.ELYTRA);
+              }
+
+              @Unique
+              private boolean wolfplus$isFlying() {
+                  return this.isNoGravity() && this.wolfplus$hasElytra();
               }
 
               @Override
@@ -946,19 +1094,80 @@ jobs:
               protected void tickRidden(Player player, Vec3 travelVector) {
                   super.tickRidden(player, travelVector);
 
-                  // Волк смотрит туда же, куда игрок.
-                  this.setRot(player.getYRot(), player.getXRot() * 0.5F);
+                  boolean flying = this.wolfplus$isFlying();
+
+                  // Нажатия пробела читаем только на клиенте всадника.
+                  boolean jump = false;
+                  if (this.level().isClientSide()) {
+                      jump = ((LivingEntityAccessor) player).wolfplus$isJumping();
+                      if (jump && !this.wolfplus$prevJump) {
+                          long now = this.level().getGameTime();
+                          if (now - this.wolfplus$lastJumpPress <= WOLFPLUS_DOUBLE_TAP_TICKS
+                                  && (flying || this.wolfplus$hasElytra())) {
+                              WolfFlightHooks.CLIENT_TOGGLE.accept(this.getId());
+                              this.wolfplus$lastJumpPress = 0L;
+                          } else {
+                              this.wolfplus$lastJumpPress = now;
+                          }
+                      }
+                      this.wolfplus$prevJump = jump;
+                  }
+
+                  // Волк смотрит туда же, куда игрок (в полёте - ещё и вверх/вниз).
+                  this.setRot(player.getYRot(), flying ? player.getXRot() : player.getXRot() * 0.5F);
                   this.yRotO = this.yBodyRot = this.yHeadRot = this.getYRot();
 
-                  // Автопрыжок через препятствие высотой в блок.
-                  if (player.zza > 0.0F && this.horizontalCollision && this.onGround()) {
-                      Vec3 motion = this.getDeltaMovement();
-                      this.setDeltaMovement(motion.x, 0.42, motion.z);
+                  Vec3 motion = this.getDeltaMovement();
+
+                  if (flying) {
+                      // Свободный полёт: куда смотрим, туда и летим.
+                      Vec3 look = player.getLookAngle();
+                      if (player.zza > 0.0F) {
+                          this.setDeltaMovement(look.scale(player.isSprinting() ? 1.1 : 0.7));
+                      } else if (player.zza < 0.0F) {
+                          this.setDeltaMovement(look.scale(-0.25));
+                      } else {
+                          this.setDeltaMovement(motion.scale(0.85));
+                      }
+                      return;
+                  }
+
+                  if (this.isInWater()) {
+                      // Держимся на поверхности (пробел - всплыть выше) и плывём вперёд.
+                      double y = motion.y;
+                      if (this.getFluidHeight(FluidTags.WATER) > 0.4) {
+                          y = Math.min(y + 0.04, 0.12);
+                      }
+                      if (jump) {
+                          y = Math.min(y + 0.04, 0.2);
+                      }
+                      double yaw = Math.toRadians(this.getYRot());
+                      double sin = Math.sin(yaw);
+                      double cos = Math.cos(yaw);
+                      double forward = player.zza * (player.isSprinting() ? 0.07 : 0.05);
+                      double side = player.xxa * 0.03;
+                      this.setDeltaMovement(
+                              motion.x + side * cos - forward * sin,
+                              y,
+                              motion.z + forward * cos + side * sin);
+                      return;
+                  }
+
+                  if (this.onGround()) {
+                      if (jump) {
+                          this.setDeltaMovement(motion.x, WOLFPLUS_JUMP_POWER, motion.z);
+                      } else if (player.zza > 0.0F && this.horizontalCollision) {
+                          // Автопрыжок через препятствие высотой в блок.
+                          this.setDeltaMovement(motion.x, 0.42, motion.z);
+                      }
                   }
               }
 
               @Override
               protected Vec3 getRiddenInput(Player player, Vec3 travelVector) {
+                  if (this.wolfplus$isFlying()) {
+                      return Vec3.ZERO; // скорость в полёте задаём напрямую в tickRidden
+                  }
                   float sideways = player.xxa * 0.5F;
                   float forward = player.zza;
                   if (forward <= 0.0F) {
@@ -1171,7 +1380,7 @@ jobs:
             "id": "wolfplus",
             "version": "${version}",
             "name": "Wolf Taming+",
-            "description": "Улучшенное приручение волков: любое мясо, настройка имени, породы и ошейника, гарантированное число кормлений, возможность расприручить и ездить верхом (с седлом и без).",
+            "description": "Улучшенное приручение волков: любое мясо, настройка имени, породы и ошейника, гарантированное число кормлений, расприручение, верховая езда (с седлом и без), плавание, прыжок, элитры и полёт.",
             "authors": [],
             "license": "MIT",
             "environment": "*",
@@ -1180,6 +1389,7 @@ jobs:
                 "com.wolfplus.WolfPlus"
               ],
               "client": [
+                "com.wolfplus.client.render.WolfRenderInit",
                 "com.wolfplus.client.WolfPlusClient"
               ]
             },
@@ -1201,18 +1411,355 @@ jobs:
             "package": "com.wolfplus.mixin",
             "compatibilityLevel": "JAVA_25",
             "mixins": [
-              "MobAccess",
               "WolfAccess",
-              "WolfRideMixin"
+              "WolfRideMixin",
+              "LivingEntityAccessor"
             ],
             "injectors": {
               "defaultRequire": 1
             }
           }
           WOLFPLUS_EOF
+          mkdir -p 'src/main/java/com/wolfplus'
+          cat > 'src/main/java/com/wolfplus/WolfFlightHooks.java' <<'WOLFPLUS_EOF'
+          package com.wolfplus;
+
+          import java.util.function.IntConsumer;
+
+          /**
+           * Мост между общим кодом (миксин волка) и клиентом: миксин не может напрямую
+           * вызывать клиентский API сети, поэтому клиент подставляет сюда отправку пакета.
+           */
+          public final class WolfFlightHooks {
+              /** Запрос "переключить полёт у волка с таким entityId". На сервере ничего не делает. */
+              public static volatile IntConsumer CLIENT_TOGGLE = id -> {
+              };
+
+              private WolfFlightHooks() {
+              }
+          }
+          WOLFPLUS_EOF
+          mkdir -p 'src/main/java/com/wolfplus/net'
+          cat > 'src/main/java/com/wolfplus/net/WolfFlightPayload.java' <<'WOLFPLUS_EOF'
+          package com.wolfplus.net;
+
+          import com.wolfplus.WolfPlus;
+          import net.minecraft.network.RegistryFriendlyByteBuf;
+          import net.minecraft.network.codec.ByteBufCodecs;
+          import net.minecraft.network.codec.StreamCodec;
+          import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
+
+          /** Клиент -> сервер: двойной прыжок на волке - включить/выключить полёт. */
+          public record WolfFlightPayload(int entityId) implements CustomPacketPayload {
+
+              public static final CustomPacketPayload.Type<WolfFlightPayload> TYPE =
+                      new CustomPacketPayload.Type<>(WolfPlus.id("wolf_flight"));
+
+              public static final StreamCodec<RegistryFriendlyByteBuf, WolfFlightPayload> CODEC = StreamCodec.composite(
+                      ByteBufCodecs.VAR_INT, WolfFlightPayload::entityId,
+                      WolfFlightPayload::new);
+
+              @Override
+              public CustomPacketPayload.Type<? extends CustomPacketPayload> type() {
+                  return TYPE;
+              }
+          }
+          WOLFPLUS_EOF
+          mkdir -p 'src/main/java/com/wolfplus/mixin'
+          cat > 'src/main/java/com/wolfplus/mixin/LivingEntityAccessor.java' <<'WOLFPLUS_EOF'
+          package com.wolfplus.mixin;
+
+          import net.minecraft.world.entity.LivingEntity;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.gen.Accessor;
+
+          /** Читает поле jumping (нажат ли пробел у локального игрока) - нужно для прыжка и двойного прыжка верхом. */
+          @Mixin(LivingEntity.class)
+          public interface LivingEntityAccessor {
+              @Accessor("jumping")
+              boolean wolfplus$isJumping();
+          }
+          WOLFPLUS_EOF
+          mkdir -p 'src/client/java/com/wolfplus/client/render'
+          cat > 'src/client/java/com/wolfplus/client/render/WingsModel.java' <<'WOLFPLUS_EOF'
+          package com.wolfplus.client.render;
+
+          import net.minecraft.client.model.EntityModel;
+          import net.minecraft.client.model.geom.ModelPart;
+          import net.minecraft.client.renderer.entity.state.LivingEntityRenderState;
+
+          /**
+           * Крылья элитр для волка: запечённая модель ModelLayers.ELYTRA, но принимающая любое состояние рендера
+           * (ванильная ElytraModel привязана к состоянию гуманоида). Позу крыльев задаём вручную.
+           */
+          public class WingsModel extends EntityModel<LivingEntityRenderState> {
+              private static final float FOLDED = 0.2617994F;
+              private static final float SPREAD = 1.0F;
+
+              private final ModelPart left;
+              private final ModelPart right;
+
+              public WingsModel(ModelPart root) {
+                  super(root);
+                  this.left = root.getChild("left_wing");
+                  this.right = root.getChild("right_wing");
+              }
+
+              /** true - крылья раскрыты (полёт), false - сложены. */
+              public void setSpread(boolean spread) {
+                  float z = spread ? SPREAD : FOLDED;
+                  this.left.xRot = FOLDED;
+                  this.left.zRot = -z;
+                  this.right.xRot = FOLDED;
+                  this.right.zRot = z;
+              }
+          }
+          WOLFPLUS_EOF
+          mkdir -p 'src/client/java/com/wolfplus/client/render'
+          cat > 'src/client/java/com/wolfplus/client/render/WolfGearLayer.java' <<'WOLFPLUS_EOF'
+          package com.wolfplus.client.render;
+
+          import com.mojang.blaze3d.vertex.PoseStack;
+          import com.mojang.math.Axis;
+          import com.wolfplus.WolfPlus;
+          import net.minecraft.client.Minecraft;
+          import net.minecraft.client.model.EntityModel;
+          import net.minecraft.client.model.Model;
+          import net.minecraft.client.model.geom.EntityModelSet;
+          import net.minecraft.client.model.geom.ModelLayers;
+          import net.minecraft.client.model.geom.ModelPart;
+          import net.minecraft.client.renderer.SubmitNodeCollector;
+          import net.minecraft.client.renderer.entity.EntityRendererProvider;
+          import net.minecraft.client.renderer.entity.RenderLayerParent;
+          import net.minecraft.client.renderer.entity.layers.EquipmentLayerRenderer;
+          import net.minecraft.client.renderer.entity.layers.RenderLayer;
+          import net.minecraft.client.renderer.entity.state.LivingEntityRenderState;
+          import net.minecraft.client.resources.model.EquipmentClientInfo;
+          import net.minecraft.core.component.DataComponents;
+          import net.minecraft.resources.ResourceKey;
+          import net.minecraft.world.entity.Entity;
+          import net.minecraft.world.entity.EquipmentSlot;
+          import net.minecraft.world.entity.animal.wolf.Wolf;
+          import net.minecraft.world.item.ItemStack;
+          import net.minecraft.world.item.Items;
+          import net.minecraft.world.item.equipment.EquipmentAsset;
+          import net.minecraft.world.item.equipment.EquipmentAssets;
+
+          /**
+           * Слой рендера волка: седло и элитры.
+           *
+           * Седло рисуется "как броня для волка" (LayerType.WOLF_BODY) с собственным ассетом wolfplus:wolf_saddle.
+           * Элитры - ванильными текстурами крыльев (LayerType.WINGS) на отдельной модели, уложенной на спину.
+           * Снаряжение берём из клиентской копии волка по id из состояния рендера;
+           * у превью-волка в меню id фиктивный, поэтому там ничего не рисуется.
+           *
+           * Любая ошибка при отрисовке один раз пишется в лог, после чего слой отключается (игра не падает).
+           */
+          public class WolfGearLayer<S extends LivingEntityRenderState, M extends EntityModel<? super S>>
+                  extends RenderLayer<S, M> {
+
+              private static final ResourceKey<EquipmentAsset> SADDLE_ASSET =
+                      ResourceKey.create(EquipmentAssets.ROOT_ID, WolfPlus.id("wolf_saddle"));
+
+              private final EquipmentLayerRenderer equipmentRenderer;
+              private final EntityModel<S> saddleModel;
+              private final WingsModel wingsModel;
+              private boolean broken;
+
+              @SuppressWarnings("unchecked")
+              public WolfGearLayer(RenderLayerParent<S, M> parent, EntityRendererProvider.Context context) {
+                  super(parent);
+                  this.equipmentRenderer = context.getEquipmentRenderer();
+                  EntityModelSet models = context.getModelSet();
+
+                  // Модель седла - такая же, как у волка, но "раздутая" (макет брони волка), чтобы не мерцало.
+                  EntityModel<S> saddle = null;
+                  try {
+                      Object created = parent.getModel().getClass()
+                              .getConstructor(ModelPart.class)
+                              .newInstance(models.bakeLayer(ModelLayers.WOLF_ARMOR));
+                      saddle = (EntityModel<S>) created;
+                  } catch (ReflectiveOperationException | RuntimeException ex) {
+                      System.err.println("[wolfplus] saddle model unavailable: " + ex);
+                  }
+                  this.saddleModel = saddle;
+                  this.wingsModel = new WingsModel(models.bakeLayer(ModelLayers.ELYTRA));
+              }
+
+              @Override
+              public void submit(PoseStack poseStack, SubmitNodeCollector collector, int lightCoords, S state,
+                      float yRot, float xRot) {
+                  if (this.broken) {
+                      return;
+                  }
+                  try {
+                      Minecraft mc = Minecraft.getInstance();
+                      if (mc.level == null) {
+                          return;
+                      }
+                      Entity entity = mc.level.getEntity(state.id);
+                      if (!(entity instanceof Wolf wolf) || wolf.isBaby()) {
+                          return;
+                      }
+
+                      ItemStack saddle = wolf.getItemBySlot(EquipmentSlot.SADDLE);
+                      if (!saddle.isEmpty() && this.saddleModel != null) {
+                          this.saddleModel.setupAnim(state);
+                          this.equipmentRenderer.renderLayers(EquipmentClientInfo.LayerType.WOLF_BODY, SADDLE_ASSET,
+                                  this.saddleModel, state, saddle, poseStack, collector, lightCoords, 0);
+                      }
+
+                      ItemStack elytra = wolf.getItemBySlot(EquipmentSlot.CHEST);
+                      if (elytra.is(Items.ELYTRA)) {
+                          var equippable = elytra.get(DataComponents.EQUIPPABLE);
+                          if (equippable != null && equippable.assetId().isPresent()) {
+                              this.wingsModel.setSpread(wolf.isNoGravity());
+                              poseStack.pushPose();
+                              // Крылья - на спину: в плечах у загривка, лёжа вдоль тела к хвосту.
+                              poseStack.translate(0.0F, 10.5F / 16.0F, 1.0F / 16.0F);
+                              poseStack.mulPose(Axis.XP.rotationDegrees(90.0F));
+                              poseStack.scale(0.7F, 0.7F, 0.7F);
+                              this.equipmentRenderer.renderLayers(EquipmentClientInfo.LayerType.WINGS,
+                                      equippable.assetId().get(), this.wingsModel, state, elytra, poseStack, collector,
+                                      lightCoords, 0);
+                              poseStack.popPose();
+                          }
+                      }
+                  } catch (Throwable ex) {
+                      this.broken = true;
+                      System.err.println("[wolfplus] gear layer disabled after error: " + ex);
+                  }
+              }
+          }
+          WOLFPLUS_EOF
+          mkdir -p 'src/client/java/com/wolfplus/client/render'
+          cat > 'src/client/java/com/wolfplus/client/render/WolfRenderInit.java' <<'WOLFPLUS_EOF'
+          package com.wolfplus.client.render;
+
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.rendering.v1.LivingEntityRenderLayerRegistrationCallback;
+          import net.minecraft.core.registries.BuiltInRegistries;
+
+          /**
+           * Подключает слой седла и элитр к рендереру волка.
+           * Это отдельная клиентская точка входа: если слой не собрался или сломался, остальной мод не страдает.
+           */
+          public class WolfRenderInit implements ClientModInitializer {
+              @Override
+              @SuppressWarnings({"rawtypes", "unchecked"})
+              public void onInitializeClient() {
+                  LivingEntityRenderLayerRegistrationCallback.EVENT.register((entityType, renderer, helper, context) -> {
+                      if (!"minecraft:wolf".equals(BuiltInRegistries.ENTITY_TYPE.getKey(entityType).toString())) {
+                          return;
+                      }
+                      try {
+                          helper.register(new WolfGearLayer(renderer, context));
+                      } catch (Throwable ex) {
+                          System.err.println("[wolfplus] could not add gear layer: " + ex);
+                      }
+                  });
+              }
+          }
+          WOLFPLUS_EOF
+          mkdir -p 'src/main/resources/assets/wolfplus/equipment'
+          cat > 'src/main/resources/assets/wolfplus/equipment/wolf_saddle.json' <<'WOLFPLUS_EOF'
+          {
+            "layers": {
+              "wolf_body": [
+                {
+                  "texture": "wolfplus:wolf_saddle"
+                }
+              ]
+            }
+          }
+          WOLFPLUS_EOF
+          python3 - <<'WOLFPLUS_EOF'
+          import os, struct, zlib
+
+          # Текстура седла для волка (раскладка 64x32 как у брони волка): сиденье на спине + подпруга вокруг туловища.
+          W, H = 64, 32
+          px = [[(0, 0, 0, 0)] * W for _ in range(H)]
+
+          def rect(x0, y0, x1, y1, c):
+              for y in range(y0, y1):
+                  for x in range(x0, x1):
+                      px[y][x] = c
+
+          SEAT = (139, 90, 43, 255)
+          EDGE = (92, 58, 26, 255)
+          BELT = (60, 36, 16, 255)
+          BUCKLE = (205, 205, 205, 255)
+
+          rect(36, 20, 42, 29, SEAT)                 # спина
+          for x in range(36, 42):
+              px[20][x] = EDGE
+              px[28][x] = EDGE
+          for y in range(20, 29):
+              px[y][36] = EDGE
+              px[y][41] = EDGE
+          for x0 in (18, 24, 30, 36):                # подпруга по всем четырём граням туловища
+              rect(x0, 24, x0 + 6, 26, BELT)
+          rect(26, 24, 28, 26, BUCKLE)               # пряжка на брюхе
+
+          raw = b"".join(b"\x00" + bytes(v for p in row for v in p) for row in px)
+
+          def chunk(tag, data):
+              body = tag + data
+              return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+          png = (b"\x89PNG\r\n\x1a\n"
+                 + chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 6, 0, 0, 0))
+                 + chunk(b"IDAT", zlib.compress(raw, 9))
+                 + chunk(b"IEND", b""))
+
+          out = "src/main/resources/assets/wolfplus/textures/entity/equipment/wolf_body"
+          os.makedirs(out, exist_ok=True)
+          with open(out + "/wolf_saddle.png", "wb") as f:
+              f.write(png)
+          WOLFPLUS_EOF
 
       - name: Build
-        run: gradle build --stacktrace
+        run: |
+          # Слой рендера (седло/элитры на модели) завязан на внутренние классы Minecraft 26.2.
+          # Если он не соберётся - собираем мод без него, чтобы остальное работало.
+          if ! gradle build --stacktrace; then
+            echo "::warning::Render layer failed to compile - rebuilding WITHOUT saddle/elytra visuals"
+            rm -rf src/client/java/com/wolfplus/client/render
+            sed -i '/WolfRenderInit/d' src/main/resources/fabric.mod.json
+            gradle build --stacktrace
+          fi
+
+      # Выгрузка сигнатур нужных классов Minecraft/Fabric (для отладки рендера): Artifacts -> api-dump
+      - name: Dump API signatures
+        if: always()
+        run: |
+          mkdir -p dump
+          find ~/.gradle -name '*.jar' -size +1M 2>/dev/null > dump/jars.txt || true
+          MC=""
+          FAB=""
+          while read -r j; do
+            L=$(unzip -l "$j" 2>/dev/null || true)
+            if [ -z "$MC" ] && echo "$L" | grep -q 'net/minecraft/client/renderer/entity/layers/WolfArmorLayer.class'; then MC="$j"; fi
+            if [ -z "$FAB" ] && echo "$L" | grep -q 'LivingEntityRenderLayerRegistrationCallback.class'; then FAB="$j"; fi
+          done < dump/jars.txt
+          echo "minecraft jar: $MC" > dump/api.txt
+          echo "fabric rendering jar: $FAB" >> dump/api.txt
+          if [ -n "$MC" ]; then
+            CLASSES=$(unzip -l "$MC" | awk '{print $4}' | grep -E '(WolfModel|WolfRenderState|WolfRenderer|ElytraModel|WingsLayer|EquipmentLayerRenderer|SimpleEquipmentLayer|layers/RenderLayer|EntityModelSet|geom/ModelLayers|EquipmentClientInfo|SubmitNodeCollector|LivingEntityRenderState|state/EntityRenderState|client/model/EntityModel|client/model/Model)\.class$' | sed 's/\.class$//; s#/#.#g')
+            echo "$CLASSES" >> dump/api.txt
+            javap -p -cp "$MC" $CLASSES >> dump/api.txt 2>&1 || true
+          fi
+          if [ -n "$FAB" ]; then
+            javap -p -cp "$FAB" 'net.fabricmc.fabric.api.client.rendering.v1.LivingEntityRenderLayerRegistrationCallback' 'net.fabricmc.fabric.api.client.rendering.v1.LivingEntityRenderLayerRegistrationCallback$RegistrationHelper' >> dump/api.txt 2>&1 || true
+          fi
+
+      - name: Upload API dump
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-dump
+          path: dump/api.txt
+          if-no-files-found: ignore
 
       - name: Upload jar
         uses: actions/upload-artifact@v4
