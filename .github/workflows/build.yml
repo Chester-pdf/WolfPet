@@ -40,7 +40,7 @@ jobs:
           fabric_api_version=0.161.0+26.2
 
           # Мод
-          mod_version=1.2.1
+          mod_version=1.2.2
           maven_group=com.wolfplus
           archives_base_name=wolfplus
           WOLFPLUS_EOF
@@ -1389,11 +1389,11 @@ jobs:
                 "com.wolfplus.WolfPlus"
               ],
               "client": [
-                "com.wolfplus.client.render.WolfRenderInit",
                 "com.wolfplus.client.WolfPlusClient"
               ]
             },
             "mixins": [
+              { "config": "wolfplus.client.mixins.json", "environment": "client" },
               "wolfplus.mixins.json"
             ],
             "depends": {
@@ -1481,6 +1481,29 @@ jobs:
           }
           WOLFPLUS_EOF
           mkdir -p 'src/client/java/com/wolfplus/client/render'
+          cat > 'src/client/java/com/wolfplus/client/render/WolfGearAccess.java' <<'WOLFPLUS_EOF'
+          package com.wolfplus.client.render;
+
+          import net.minecraft.world.item.ItemStack;
+
+          /**
+           * Данные о снаряжении волка, которые миксин кладёт в WolfRenderState при извлечении состояния рендера.
+           * (У состояния рендера нет id сущности, поэтому слой не может достать волка из мира - берёт всё отсюда.)
+           */
+          public interface WolfGearAccess {
+              ItemStack wolfplus$getSaddle();
+
+              void wolfplus$setSaddle(ItemStack stack);
+
+              ItemStack wolfplus$getElytra();
+
+              void wolfplus$setElytra(ItemStack stack);
+
+              boolean wolfplus$isFlying();
+
+              void wolfplus$setFlying(boolean flying);
+          }
+          WOLFPLUS_EOF
           cat > 'src/client/java/com/wolfplus/client/render/WingsModel.java' <<'WOLFPLUS_EOF'
           package com.wolfplus.client.render;
 
@@ -1498,6 +1521,7 @@ jobs:
 
               private final ModelPart left;
               private final ModelPart right;
+              private boolean spread;
 
               public WingsModel(ModelPart root) {
                   super(root);
@@ -1507,7 +1531,17 @@ jobs:
 
               /** true - крылья раскрыты (полёт), false - сложены. */
               public void setSpread(boolean spread) {
-                  float z = spread ? SPREAD : FOLDED;
+                  this.spread = spread;
+                  applyPose();
+              }
+
+              @Override
+              public void setupAnim(LivingEntityRenderState state) {
+                  applyPose();
+              }
+
+              private void applyPose() {
+                  float z = this.spread ? SPREAD : FOLDED;
                   this.left.xRot = FOLDED;
                   this.left.zRot = -z;
                   this.right.xRot = FOLDED;
@@ -1515,31 +1549,25 @@ jobs:
               }
           }
           WOLFPLUS_EOF
-          mkdir -p 'src/client/java/com/wolfplus/client/render'
           cat > 'src/client/java/com/wolfplus/client/render/WolfGearLayer.java' <<'WOLFPLUS_EOF'
           package com.wolfplus.client.render;
 
           import com.mojang.blaze3d.vertex.PoseStack;
           import com.mojang.math.Axis;
           import com.wolfplus.WolfPlus;
-          import net.minecraft.client.Minecraft;
-          import net.minecraft.client.model.EntityModel;
-          import net.minecraft.client.model.Model;
+          import net.minecraft.client.model.animal.wolf.AdultWolfModel;
+          import net.minecraft.client.model.animal.wolf.WolfModel;
           import net.minecraft.client.model.geom.EntityModelSet;
           import net.minecraft.client.model.geom.ModelLayers;
-          import net.minecraft.client.model.geom.ModelPart;
           import net.minecraft.client.renderer.SubmitNodeCollector;
           import net.minecraft.client.renderer.entity.EntityRendererProvider;
           import net.minecraft.client.renderer.entity.RenderLayerParent;
           import net.minecraft.client.renderer.entity.layers.EquipmentLayerRenderer;
           import net.minecraft.client.renderer.entity.layers.RenderLayer;
-          import net.minecraft.client.renderer.entity.state.LivingEntityRenderState;
+          import net.minecraft.client.renderer.entity.state.WolfRenderState;
           import net.minecraft.client.resources.model.EquipmentClientInfo;
           import net.minecraft.core.component.DataComponents;
           import net.minecraft.resources.ResourceKey;
-          import net.minecraft.world.entity.Entity;
-          import net.minecraft.world.entity.EquipmentSlot;
-          import net.minecraft.world.entity.animal.wolf.Wolf;
           import net.minecraft.world.item.ItemStack;
           import net.minecraft.world.item.Items;
           import net.minecraft.world.item.equipment.EquipmentAsset;
@@ -1548,117 +1576,195 @@ jobs:
           /**
            * Слой рендера волка: седло и элитры.
            *
-           * Седло рисуется "как броня для волка" (LayerType.WOLF_BODY) с собственным ассетом wolfplus:wolf_saddle.
-           * Элитры - ванильными текстурами крыльев (LayerType.WINGS) на отдельной модели, уложенной на спину.
-           * Снаряжение берём из клиентской копии волка по id из состояния рендера;
-           * у превью-волка в меню id фиктивный, поэтому там ничего не рисуется.
+           * Седло - "как броня для волка" (LayerType.WOLF_BODY, модель WOLF_ARMOR) с ассетом wolfplus:wolf_saddle.
+           * Элитры - ванильные текстуры крыльев (LayerType.WINGS) на отдельной модели, уложенной на спину.
+           * Снаряжение берётся из WolfRenderState (его заполняет WolfRendererMixin).
            *
            * Любая ошибка при отрисовке один раз пишется в лог, после чего слой отключается (игра не падает).
            */
-          public class WolfGearLayer<S extends LivingEntityRenderState, M extends EntityModel<? super S>>
-                  extends RenderLayer<S, M> {
-
+          public class WolfGearLayer extends RenderLayer<WolfRenderState, WolfModel> {
               private static final ResourceKey<EquipmentAsset> SADDLE_ASSET =
                       ResourceKey.create(EquipmentAssets.ROOT_ID, WolfPlus.id("wolf_saddle"));
 
               private final EquipmentLayerRenderer equipmentRenderer;
-              private final EntityModel<S> saddleModel;
+              private final AdultWolfModel saddleModel;
               private final WingsModel wingsModel;
               private boolean broken;
 
-              @SuppressWarnings("unchecked")
-              public WolfGearLayer(RenderLayerParent<S, M> parent, EntityRendererProvider.Context context) {
+              public WolfGearLayer(RenderLayerParent<WolfRenderState, WolfModel> parent, EntityRendererProvider.Context context) {
                   super(parent);
                   this.equipmentRenderer = context.getEquipmentRenderer();
                   EntityModelSet models = context.getModelSet();
-
-                  // Модель седла - такая же, как у волка, но "раздутая" (макет брони волка), чтобы не мерцало.
-                  EntityModel<S> saddle = null;
-                  try {
-                      Object created = parent.getModel().getClass()
-                              .getConstructor(ModelPart.class)
-                              .newInstance(models.bakeLayer(ModelLayers.WOLF_ARMOR));
-                      saddle = (EntityModel<S>) created;
-                  } catch (ReflectiveOperationException | RuntimeException ex) {
-                      System.err.println("[wolfplus] saddle model unavailable: " + ex);
-                  }
-                  this.saddleModel = saddle;
+                  this.saddleModel = new AdultWolfModel(models.bakeLayer(ModelLayers.WOLF_ARMOR));
                   this.wingsModel = new WingsModel(models.bakeLayer(ModelLayers.ELYTRA));
               }
 
               @Override
-              public void submit(PoseStack poseStack, SubmitNodeCollector collector, int lightCoords, S state,
+              public void submit(PoseStack poseStack, SubmitNodeCollector collector, int lightCoords, WolfRenderState state,
                       float yRot, float xRot) {
-                  if (this.broken) {
+                  if (this.broken || state.isBaby) {
                       return;
                   }
                   try {
-                      Minecraft mc = Minecraft.getInstance();
-                      if (mc.level == null) {
-                          return;
-                      }
-                      Entity entity = mc.level.getEntity(state.id);
-                      if (!(entity instanceof Wolf wolf) || wolf.isBaby()) {
-                          return;
-                      }
+                      WolfGearAccess gear = (WolfGearAccess) state;
 
-                      ItemStack saddle = wolf.getItemBySlot(EquipmentSlot.SADDLE);
-                      if (!saddle.isEmpty() && this.saddleModel != null) {
+                      ItemStack saddle = gear.wolfplus$getSaddle();
+                      if (!saddle.isEmpty()) {
                           this.saddleModel.setupAnim(state);
                           this.equipmentRenderer.renderLayers(EquipmentClientInfo.LayerType.WOLF_BODY, SADDLE_ASSET,
-                                  this.saddleModel, state, saddle, poseStack, collector, lightCoords, 0);
+                                  this.saddleModel, state, saddle, poseStack, collector, lightCoords, state.outlineColor);
                       }
 
-                      ItemStack elytra = wolf.getItemBySlot(EquipmentSlot.CHEST);
+                      ItemStack elytra = gear.wolfplus$getElytra();
                       if (elytra.is(Items.ELYTRA)) {
                           var equippable = elytra.get(DataComponents.EQUIPPABLE);
                           if (equippable != null && equippable.assetId().isPresent()) {
-                              this.wingsModel.setSpread(wolf.isNoGravity());
+                              this.wingsModel.setSpread(gear.wolfplus$isFlying());
                               poseStack.pushPose();
-                              // Крылья - на спину: в плечах у загривка, лёжа вдоль тела к хвосту.
-                              poseStack.translate(0.0F, 10.5F / 16.0F, 1.0F / 16.0F);
+                              // Пространство модели: y вниз, -z вперёд. Спина волка - плоскость y = 14/16.
+                              // Крыло в своих осях лежит вдоль +y (вниз), толщина вдоль +z.
+                              // Поворот +90 по X: крыло ложится вдоль спины к хвосту, наружу смотрит вверх.
+                              poseStack.translate(0.0F, 13.6F / 16.0F, -2.0F / 16.0F);
                               poseStack.mulPose(Axis.XP.rotationDegrees(90.0F));
-                              poseStack.scale(0.7F, 0.7F, 0.7F);
+                              poseStack.scale(0.6F, 0.6F, 0.6F);
                               this.equipmentRenderer.renderLayers(EquipmentClientInfo.LayerType.WINGS,
                                       equippable.assetId().get(), this.wingsModel, state, elytra, poseStack, collector,
-                                      lightCoords, 0);
+                                      lightCoords, state.outlineColor);
                               poseStack.popPose();
                           }
                       }
                   } catch (Throwable ex) {
                       this.broken = true;
                       System.err.println("[wolfplus] gear layer disabled after error: " + ex);
+                      ex.printStackTrace();
                   }
               }
           }
           WOLFPLUS_EOF
-          mkdir -p 'src/client/java/com/wolfplus/client/render'
-          cat > 'src/client/java/com/wolfplus/client/render/WolfRenderInit.java' <<'WOLFPLUS_EOF'
-          package com.wolfplus.client.render;
+          mkdir -p 'src/client/java/com/wolfplus/client/mixin'
+          cat > 'src/client/java/com/wolfplus/client/mixin/LivingEntityRendererInvoker.java' <<'WOLFPLUS_EOF'
+          package com.wolfplus.client.mixin;
 
-          import net.fabricmc.api.ClientModInitializer;
-          import net.fabricmc.fabric.api.client.rendering.v1.LivingEntityRenderLayerRegistrationCallback;
-          import net.minecraft.core.registries.BuiltInRegistries;
+          import net.minecraft.client.renderer.entity.LivingEntityRenderer;
+          import net.minecraft.client.renderer.entity.layers.RenderLayer;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.gen.Invoker;
+
+          /** addLayer у рендерера защищённый - открываем его, чтобы добавить слой волку. */
+          @Mixin(LivingEntityRenderer.class)
+          public interface LivingEntityRendererInvoker {
+              @Invoker("addLayer")
+              boolean wolfplus$addLayer(RenderLayer<?, ?> layer);
+          }
+          WOLFPLUS_EOF
+          cat > 'src/client/java/com/wolfplus/client/mixin/WolfRenderStateMixin.java' <<'WOLFPLUS_EOF'
+          package com.wolfplus.client.mixin;
+
+          import com.wolfplus.client.render.WolfGearAccess;
+          import net.minecraft.client.renderer.entity.state.WolfRenderState;
+          import net.minecraft.world.item.ItemStack;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.Unique;
+
+          /** Добавляет в состояние рендера волка поля со снаряжением. */
+          @Mixin(WolfRenderState.class)
+          public class WolfRenderStateMixin implements WolfGearAccess {
+              @Unique
+              private ItemStack wolfplus$saddle = ItemStack.EMPTY;
+
+              @Unique
+              private ItemStack wolfplus$elytra = ItemStack.EMPTY;
+
+              @Unique
+              private boolean wolfplus$flying;
+
+              @Override
+              public ItemStack wolfplus$getSaddle() {
+                  return this.wolfplus$saddle;
+              }
+
+              @Override
+              public void wolfplus$setSaddle(ItemStack stack) {
+                  this.wolfplus$saddle = stack;
+              }
+
+              @Override
+              public ItemStack wolfplus$getElytra() {
+                  return this.wolfplus$elytra;
+              }
+
+              @Override
+              public void wolfplus$setElytra(ItemStack stack) {
+                  this.wolfplus$elytra = stack;
+              }
+
+              @Override
+              public boolean wolfplus$isFlying() {
+                  return this.wolfplus$flying;
+              }
+
+              @Override
+              public void wolfplus$setFlying(boolean flying) {
+                  this.wolfplus$flying = flying;
+              }
+          }
+          WOLFPLUS_EOF
+          cat > 'src/client/java/com/wolfplus/client/mixin/WolfRendererMixin.java' <<'WOLFPLUS_EOF'
+          package com.wolfplus.client.mixin;
+
+          import com.wolfplus.client.render.WolfGearAccess;
+          import com.wolfplus.client.render.WolfGearLayer;
+          import net.minecraft.client.renderer.entity.EntityRendererProvider;
+          import net.minecraft.client.renderer.entity.WolfRenderer;
+          import net.minecraft.client.renderer.entity.state.WolfRenderState;
+          import net.minecraft.world.entity.EquipmentSlot;
+          import net.minecraft.world.entity.animal.wolf.Wolf;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
           /**
-           * Подключает слой седла и элитр к рендереру волка.
-           * Это отдельная клиентская точка входа: если слой не собрался или сломался, остальной мод не страдает.
+           * 1) Добавляет волку слой седла/элитр (без зависимости от Fabric rendering API).
+           * 2) Копирует снаряжение волка в состояние рендера.
            */
-          public class WolfRenderInit implements ClientModInitializer {
-              @Override
-              @SuppressWarnings({"rawtypes", "unchecked"})
-              public void onInitializeClient() {
-                  LivingEntityRenderLayerRegistrationCallback.EVENT.register((entityType, renderer, helper, context) -> {
-                      if (!"minecraft:wolf".equals(BuiltInRegistries.ENTITY_TYPE.getKey(entityType).toString())) {
-                          return;
-                      }
-                      try {
-                          helper.register(new WolfGearLayer(renderer, context));
-                      } catch (Throwable ex) {
-                          System.err.println("[wolfplus] could not add gear layer: " + ex);
-                      }
-                  });
+          @Mixin(WolfRenderer.class)
+          public abstract class WolfRendererMixin {
+              @Inject(method = "<init>", at = @At("TAIL"))
+              private void wolfplus$addGearLayer(EntityRendererProvider.Context context, CallbackInfo ci) {
+                  try {
+                      WolfRenderer self = (WolfRenderer) (Object) this;
+                      ((LivingEntityRendererInvoker) (Object) this).wolfplus$addLayer(new WolfGearLayer(self, context));
+                  } catch (Throwable ex) {
+                      System.err.println("[wolfplus] could not add gear layer: " + ex);
+                      ex.printStackTrace();
+                  }
               }
+
+              @Inject(method = "extractRenderState(Lnet/minecraft/world/entity/animal/wolf/Wolf;Lnet/minecraft/client/renderer/entity/state/WolfRenderState;F)V",
+                      at = @At("TAIL"))
+              private void wolfplus$extractGear(Wolf wolf, WolfRenderState state, float partialTick, CallbackInfo ci) {
+                  WolfGearAccess gear = (WolfGearAccess) state;
+                  gear.wolfplus$setSaddle(wolf.getItemBySlot(EquipmentSlot.SADDLE));
+                  gear.wolfplus$setElytra(wolf.getItemBySlot(EquipmentSlot.CHEST));
+                  gear.wolfplus$setFlying(wolf.isNoGravity());
+              }
+          }
+          WOLFPLUS_EOF
+          mkdir -p 'src/client/resources'
+          cat > 'src/client/resources/wolfplus.client.mixins.json' <<'WOLFPLUS_EOF'
+          {
+            "required": true,
+            "package": "com.wolfplus.client.mixin",
+            "compatibilityLevel": "JAVA_25",
+            "client": [
+              "LivingEntityRendererInvoker",
+              "WolfRenderStateMixin",
+              "WolfRendererMixin"
+            ],
+            "injectors": {
+              "defaultRequire": 1
+            }
           }
           WOLFPLUS_EOF
           mkdir -p 'src/main/resources/assets/wolfplus/equipment'
@@ -1724,8 +1830,8 @@ jobs:
           # Если он не соберётся - собираем мод без него, чтобы остальное работало.
           if ! gradle build --stacktrace; then
             echo "::warning::Render layer failed to compile - rebuilding WITHOUT saddle/elytra visuals"
-            rm -rf src/client/java/com/wolfplus/client/render
-            sed -i '/WolfRenderInit/d' src/main/resources/fabric.mod.json
+            rm -rf src/client/java/com/wolfplus/client/render src/client/java/com/wolfplus/client/mixin src/client/resources
+            sed -i '/wolfplus.client.mixins.json/d' src/main/resources/fabric.mod.json
             gradle build --stacktrace
           fi
 
@@ -1742,10 +1848,11 @@ jobs:
             if [ -z "$MC" ] && echo "$L" | grep -q 'net/minecraft/client/renderer/entity/layers/WolfArmorLayer.class'; then MC="$j"; fi
             if [ -z "$FAB" ] && echo "$L" | grep -q 'LivingEntityRenderLayerRegistrationCallback.class'; then FAB="$j"; fi
           done < dump/jars.txt
+          if [ -z "$FAB" ]; then FAB=$(find ~/.gradle -name 'fabric-rendering-v1*.jar' ! -name '*sources*' 2>/dev/null | head -1); fi
           echo "minecraft jar: $MC" > dump/api.txt
           echo "fabric rendering jar: $FAB" >> dump/api.txt
           if [ -n "$MC" ]; then
-            CLASSES=$(unzip -l "$MC" | awk '{print $4}' | grep -E '(WolfModel|WolfRenderState|WolfRenderer|ElytraModel|WingsLayer|EquipmentLayerRenderer|SimpleEquipmentLayer|layers/RenderLayer|EntityModelSet|geom/ModelLayers|EquipmentClientInfo|SubmitNodeCollector|LivingEntityRenderState|state/EntityRenderState|client/model/EntityModel|client/model/Model)\.class$' | sed 's/\.class$//; s#/#.#g')
+            CLASSES=$(unzip -l "$MC" | awk '{print $4}' | grep -E '(WolfModel|WolfRenderState|WolfRenderer|ElytraModel|WingsLayer|EquipmentLayerRenderer|SimpleEquipmentLayer|layers/RenderLayer|EntityModelSet|geom/ModelLayers|EquipmentClientInfo|SubmitNodeCollector|LivingEntityRenderState|state/EntityRenderState|client/model/EntityModel|client/model/Model|EntityRendererProvider|LivingEntityRenderer|AgeableMobRenderer|RenderLayerParent|Equippable|EquipmentAssets)\.class$' | sed 's/\.class$//; s#/#.#g')
             echo "$CLASSES" >> dump/api.txt
             javap -p -cp "$MC" $CLASSES >> dump/api.txt 2>&1 || true
           fi
