@@ -40,7 +40,7 @@ jobs:
           fabric_api_version=0.161.0+26.2
 
           # Мод
-          mod_version=1.2.2
+          mod_version=1.3.0
           maven_group=com.wolfplus
           archives_base_name=wolfplus
           WOLFPLUS_EOF
@@ -109,6 +109,83 @@ jobs:
               targetCompatibility = JavaVersion.VERSION_25
           }
           WOLFPLUS_EOF
+          mkdir -p 'tools'
+          cat > 'tools/resolve.py' <<'WOLFPLUS_EOF'
+          """Подставляет настоящие пути классов Minecraft вместо токенов @@Имя@@ / @@Имя|подстрока@@.
+
+          Скачивает client.jar нужной версии и ищет в нём классы по простому имени, так что
+          переезд классов по пакетам больше не ломает сборку. Нужен для миксинов кошки и кролика.
+          """
+          import io
+          import json
+          import os
+          import re
+          import sys
+          import urllib.request
+          import zipfile
+
+          VERSION = os.environ.get("MC_VERSION", "26.2")
+
+
+          def get(url):
+              with urllib.request.urlopen(url, timeout=120) as r:
+                  return r.read()
+
+
+          manifest = json.loads(get("https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"))
+          entry = next((v for v in manifest["versions"] if v["id"] == VERSION), None)
+          if entry is None:
+              sys.exit("Версия не найдена в манифесте: " + VERSION)
+          meta = json.loads(get(entry["url"]))
+          jar = zipfile.ZipFile(io.BytesIO(get(meta["downloads"]["client"]["url"])))
+
+          index = {}
+          for name in jar.namelist():
+              if name.endswith(".class") and "$" not in name:
+                  simple = name.rsplit("/", 1)[-1][:-6]
+                  index.setdefault(simple, []).append(name[:-6].replace("/", "."))
+
+          TOKEN = re.compile(r"@@(\w+)(?:\|([\w.]+))?@@")
+          errors = []
+          resolved = {}
+
+
+          def pick(simple, hint):
+              cands = index.get(simple, [])
+              if hint:
+                  cands = [c for c in cands if hint in c]
+              cands = [c for c in cands if c.startswith("net.minecraft.")] or cands
+              if len(cands) == 1:
+                  return cands[0]
+              errors.append("%s%s -> %s" % (simple, "|" + hint if hint else "", cands or "не найден"))
+              return None
+
+
+          def sub(m):
+              key = (m.group(1), m.group(2))
+              if key not in resolved:
+                  resolved[key] = pick(*key)
+              return resolved[key] or m.group(0)
+
+
+          for root, _, files in os.walk("src/main/java"):
+              for f in files:
+                  if not f.endswith(".java"):
+                      continue
+                  p = os.path.join(root, f)
+                  text = open(p, encoding="utf-8").read()
+                  new = TOKEN.sub(sub, text)
+                  if new != text:
+                      open(p, "w", encoding="utf-8").write(new)
+
+          for (simple, hint), fqn in resolved.items():
+              print("%-28s %s" % (simple, fqn))
+          if errors:
+              print("НЕ УДАЛОСЬ ОПРЕДЕЛИТЬ КЛАССЫ:")
+              for e in errors:
+                  print("  " + e)
+              sys.exit(1)
+          WOLFPLUS_EOF
           mkdir -p 'src/client/java/com/wolfplus/client'
           cat > 'src/client/java/com/wolfplus/client/UntameConfirmScreen.java' <<'WOLFPLUS_EOF'
           package com.wolfplus.client;
@@ -160,7 +237,7 @@ jobs:
                   }
               }
 
-              /** Отмена / Esc: возвращаемся в меню волка. */
+              /** Отмена / Esc: возвращаемся в меню питомца. */
               @Override
               public void onClose() {
                   this.minecraft.gui.setScreen(this.parent);
@@ -185,8 +262,8 @@ jobs:
           cat > 'src/client/java/com/wolfplus/client/WolfMenuScreen.java' <<'WOLFPLUS_EOF'
           package com.wolfplus.client;
 
+          import com.wolfplus.PetKind;
           import com.wolfplus.WolfOptions;
-          import com.wolfplus.mixin.WolfAccess;
           import com.wolfplus.net.OpenWolfMenuPayload;
           import com.wolfplus.net.WolfSettingsPayload;
           import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
@@ -200,14 +277,15 @@ jobs:
           import net.minecraft.world.entity.Entity;
           import net.minecraft.world.entity.EntitySpawnReason;
           import net.minecraft.world.entity.EntityType;
-          import net.minecraft.world.entity.animal.wolf.Wolf;
+          import net.minecraft.world.entity.Mob;
+          import net.minecraft.world.entity.TamableAnimal;
           import net.minecraft.world.item.DyeColor;
 
-          /** Меню настройки волка: имя, порода, цвет ошейника, 3D-превью (+ расприручение). */
+          /** Меню настройки питомца (волк, кошка, кролик): имя, порода, цвет ошейника, 3D-превью (+ расприручение). */
           public class WolfMenuScreen extends Screen {
               private static final DyeColor[] COLORS = DyeColor.values();
 
-              /** Фиктивный ID для превью-волка: в мир он не попадает, поэтому коллизий нет. */
+              /** Фиктивный ID для превью-питомца: в мир он не попадает, поэтому коллизий нет. */
               private static final int PREVIEW_ENTITY_ID = 0x7FFFFF01;
 
               private static final int PANEL_W = 96;
@@ -216,6 +294,9 @@ jobs:
 
               private final int entityId;
               private final boolean firstTime;
+              private final PetKind kind;
+              /** У некоторых питомцев (кролик без поддержки пород) выбора породы нет. */
+              private final boolean hasVariants;
 
               private String name;
               private int variant;
@@ -224,8 +305,8 @@ jobs:
               private Button variantButton;
               private Button colorButton;
 
-              /** Клиентская копия волка только для показа модельки. */
-              private Wolf preview;
+              /** Клиентская копия питомца только для показа модельки. */
+              private Mob preview;
               private float previewBase = 0.85f;
 
               private int panelX;
@@ -235,8 +316,12 @@ jobs:
                   super(Component.translatable(payload.firstTime() ? "wolfplus.menu.title_new" : "wolfplus.menu.title"));
                   this.entityId = payload.entityId();
                   this.firstTime = payload.firstTime();
+                  this.kind = PetKind.fromOrdinal(payload.kind());
                   this.name = payload.name();
-                  this.variant = Math.floorMod(payload.variantIndex(), WolfOptions.VARIANTS.size());
+                  this.hasVariants = payload.variantIndex() >= 0;
+                  this.variant = this.hasVariants
+                          ? Math.floorMod(payload.variantIndex(), this.kind.variants().size())
+                          : 0;
                   this.color = Math.floorMod(payload.colorId(), COLORS.length);
               }
 
@@ -270,13 +355,15 @@ jobs:
                   this.setInitialFocus(nameBox);
 
                   // II. Порода
-                  int variantY = top + 66;
-                  this.addRenderableWidget(Button.builder(Component.literal("<"), b -> cycleVariant(-1))
-                          .bounds(ctrlX, variantY, 20, 20).build());
-                  this.variantButton = this.addRenderableWidget(Button.builder(variantLabel(), b -> cycleVariant(1))
-                          .bounds(ctrlX + 22, variantY, ctrlW - 44, 20).build());
-                  this.addRenderableWidget(Button.builder(Component.literal(">"), b -> cycleVariant(1))
-                          .bounds(ctrlX + ctrlW - 20, variantY, 20, 20).build());
+                  if (this.hasVariants) {
+                      int variantY = top + 66;
+                      this.addRenderableWidget(Button.builder(Component.literal("<"), b -> cycleVariant(-1))
+                              .bounds(ctrlX, variantY, 20, 20).build());
+                      this.variantButton = this.addRenderableWidget(Button.builder(variantLabel(), b -> cycleVariant(1))
+                              .bounds(ctrlX + 22, variantY, ctrlW - 44, 20).build());
+                      this.addRenderableWidget(Button.builder(Component.literal(">"), b -> cycleVariant(1))
+                              .bounds(ctrlX + ctrlW - 20, variantY, 20, 20).build());
+                  }
 
                   // III. Цвет ошейника
                   int colorY = top + 106;
@@ -305,34 +392,36 @@ jobs:
 
               // ------------------------------------------------------------ превью
 
-              /** Создаёт клиентскую копию волка (в мир она не добавляется) и применяет текущие настройки. */
+              /** Создаёт клиентскую копию питомца (в мир она не добавляется) и применяет текущие настройки. */
               private void makePreview() {
                   this.preview = null;
                   if (this.minecraft == null || this.minecraft.level == null) {
                       return;
                   }
                   try {
-                      // В 26.2 константы EntityType.WOLF нет - ищем тип волка в реестре.
-                      EntityType<?> wolfType = null;
-                      for (EntityType<?> type : BuiltInRegistries.ENTITY_TYPE) {
-                          if (BuiltInRegistries.ENTITY_TYPE.getKey(type).toString().equals("minecraft:wolf")) {
-                              wolfType = type;
+                      // В 26.2 констант вида EntityType.WOLF нет - ищем тип в реестре.
+                      EntityType<?> type = null;
+                      for (EntityType<?> candidate : BuiltInRegistries.ENTITY_TYPE) {
+                          if (BuiltInRegistries.ENTITY_TYPE.getKey(candidate).toString().equals(this.kind.typeId)) {
+                              type = candidate;
                               break;
                           }
                       }
-                      if (wolfType == null) {
+                      if (type == null) {
                           return;
                       }
-                      Entity created = wolfType.create(this.minecraft.level, EntitySpawnReason.LOAD);
-                      if (!(created instanceof Wolf wolf)) {
+                      Entity created = type.create(this.minecraft.level, EntitySpawnReason.LOAD);
+                      if (!(created instanceof Mob mob)) {
                           return;
                       }
                       // Моб вне мира не имеет ID, а рендерер его требует - выдаём фиктивный.
-                      wolf.setId(PREVIEW_ENTITY_ID);
-                      wolf.setTame(true, false);        // ошейник рисуется только у прирученного
-                      wolf.setInSittingPose(true);      // сидит, как только что приручённый
-                      this.previewBase = Math.max(wolf.getBbHeight(), wolf.getBbWidth() * 0.9f);
-                      this.preview = wolf;
+                      mob.setId(PREVIEW_ENTITY_ID);
+                      if (mob instanceof TamableAnimal tamable) {
+                          tamable.setTame(true, false);        // ошейник рисуется только у прирученного
+                          tamable.setInSittingPose(true);      // сидит, как только что приручённый
+                      }
+                      this.previewBase = Math.max(mob.getBbHeight(), mob.getBbWidth() * 0.9f);
+                      this.preview = mob;
                       updatePreview();
                   } catch (Throwable ex) {
                       this.preview = null;
@@ -343,15 +432,17 @@ jobs:
                   if (this.preview == null) {
                       return;
                   }
-                  WolfOptions.applyVariant(this.preview, this.variant);
-                  ((WolfAccess) this.preview).wolfplus$setCollarColor(COLORS[this.color]);
+                  if (this.hasVariants) {
+                      this.kind.applyVariant(this.preview, this.variant);
+                  }
+                  this.kind.setCollar(this.preview, COLORS[this.color]);
               }
 
               // ------------------------------------------------------------ подписи и кнопки
 
               private Component variantLabel() {
                   return Component.translatable("wolfplus.menu.breed",
-                          Component.translatable("wolfplus.variant." + WolfOptions.VARIANTS.get(this.variant)));
+                          Component.translatable(this.kind.variantKey(this.variant)));
               }
 
               private Component colorLabel() {
@@ -362,7 +453,7 @@ jobs:
               }
 
               private void cycleVariant(int step) {
-                  this.variant = Math.floorMod(this.variant + step, WolfOptions.VARIANTS.size());
+                  this.variant = Math.floorMod(this.variant + step, this.kind.variants().size());
                   this.variantButton.setMessage(variantLabel());
                   updatePreview();
               }
@@ -374,7 +465,8 @@ jobs:
               }
 
               private void save() {
-                  ClientPlayNetworking.send(new WolfSettingsPayload(this.entityId, this.name, this.variant, COLORS[this.color].getId()));
+                  ClientPlayNetworking.send(new WolfSettingsPayload(this.entityId, this.name,
+                          this.hasVariants ? this.variant : -1, COLORS[this.color].getId()));
                   this.onClose();
               }
 
@@ -392,7 +484,9 @@ jobs:
 
                   drawCentered(graphics, this.title.getString(), left + total / 2, top, 0xFFFFFFFF);
                   drawLabel(graphics, Component.translatable("wolfplus.menu.name").getString(), ctrlX, top + 14);
-                  drawLabel(graphics, Component.translatable("wolfplus.menu.breed_label").getString(), ctrlX, top + 54);
+                  if (this.hasVariants) {
+                      drawLabel(graphics, Component.translatable("wolfplus.menu.breed_label").getString(), ctrlX, top + 54);
+                  }
                   drawLabel(graphics, Component.translatable("wolfplus.menu.collar_label").getString(), ctrlX, top + 94);
 
                   // Тёмная панель под моделькой.
@@ -409,10 +503,15 @@ jobs:
                               scale, 0.0625f, (float) mouseX, (float) mouseY, this.preview);
                   }
 
-                  // Подпись под моделькой: имя, а если его нет - порода.
-                  String caption = this.name.isBlank()
-                          ? Component.translatable("wolfplus.variant." + WolfOptions.VARIANTS.get(this.variant)).getString()
-                          : this.name.strip();
+                  // Подпись под моделькой: имя, а если его нет - порода (или название вида).
+                  String caption;
+                  if (!this.name.isBlank()) {
+                      caption = this.name.strip();
+                  } else if (this.hasVariants) {
+                      caption = Component.translatable(this.kind.variantKey(this.variant)).getString();
+                  } else {
+                      caption = this.preview != null ? this.preview.getType().getDescription().getString() : "";
+                  }
                   while (caption.length() > 1 && this.font.width(caption) > PANEL_W - 6) {
                       caption = caption.substring(0, caption.length() - 1);
                   }
@@ -432,6 +531,7 @@ jobs:
           cat > 'src/client/java/com/wolfplus/client/WolfPlusClient.java' <<'WOLFPLUS_EOF'
           package com.wolfplus.client;
 
+          import com.wolfplus.PetKind;
           import com.wolfplus.WolfFlightHooks;
           import com.wolfplus.net.MountWolfPayload;
           import com.wolfplus.net.OpenWolfMenuPayload;
@@ -440,7 +540,6 @@ jobs:
           import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
           import net.fabricmc.fabric.api.event.player.AttackEntityCallback;
           import net.minecraft.world.InteractionResult;
-          import net.minecraft.world.entity.animal.wolf.Wolf;
 
           public class WolfPlusClient implements ClientModInitializer {
               @Override
@@ -448,22 +547,22 @@ jobs:
                   ClientPlayNetworking.registerGlobalReceiver(OpenWolfMenuPayload.TYPE, (payload, context) ->
                           context.client().gui.setScreen(new WolfMenuScreen(payload)));
 
-                  // Двойной прыжок на волке (детект в WolfRideMixin) -> пакет переключения полёта.
+                  // Двойной прыжок верхом (детект в RideLogic) -> пакет переключения полёта.
                   WolfFlightHooks.CLIENT_TOGGLE = entityId -> ClientPlayNetworking.send(new WolfFlightPayload(entityId));
 
-                  // Shift + удар по своему волку -> запрос на посадку верхом.
+                  // Shift + удар по своему питомцу (волк, кошка, кролик) -> запрос на посадку верхом.
                   // Событие на клиенте отменяет сам удар (пакет атаки на сервер не уходит),
                   // поэтому посадку просим отдельным пакетом.
                   AttackEntityCallback.EVENT.register((player, level, hand, entity, hitResult) -> {
                       if (!level.isClientSide() || player.isSpectator()) {
                           return InteractionResult.PASS;
                       }
-                      if (entity instanceof Wolf wolf
-                              && wolf.isTame()
+                      if (PetKind.of(entity) != null
+                              && PetKind.isTamed(entity)
                               && player.isShiftKeyDown()
                               && !player.isPassenger()
-                              && wolf.isOwnedBy(player)) {
-                          ClientPlayNetworking.send(new MountWolfPayload(wolf.getId()));
+                              && PetKind.isOwnedBy(entity, player)) {
+                          ClientPlayNetworking.send(new MountWolfPayload(entity.getId()));
                           return InteractionResult.SUCCESS;
                       }
                       return InteractionResult.PASS;
@@ -525,6 +624,429 @@ jobs:
           }
           WOLFPLUS_EOF
           mkdir -p 'src/main/java/com/wolfplus'
+          cat > 'src/main/java/com/wolfplus/Reflect.java' <<'WOLFPLUS_EOF'
+          package com.wolfplus;
+
+          import java.lang.reflect.Method;
+
+          /**
+           * Мелкие помощники для рефлексии. Через них мод работает с кошками и кроликами, не завися
+           * от точных сигнатур их классов, и с мод-кроликом (Rabbit Taming), которого может не быть.
+           */
+          final class Reflect {
+              private Reflect() {
+              }
+
+              /** Ищет метод по имени и числу параметров в классе и его родителях (в том числе приватный). */
+              static Method find(Class<?> type, String name, int params) {
+                  for (Class<?> c = type; c != null; c = c.getSuperclass()) {
+                      for (Method m : c.getDeclaredMethods()) {
+                          if (m.getName().equals(name) && m.getParameterCount() == params) {
+                              try {
+                                  m.setAccessible(true);
+                              } catch (RuntimeException ignored) {
+                                  // всё равно пробуем вызвать
+                              }
+                              return m;
+                          }
+                      }
+                  }
+                  return null;
+              }
+
+              /** Вызывает метод; если его нет или вызов не удался - возвращает null. */
+              static Object call(Object target, String name, Object... args) {
+                  Method m = find(target.getClass(), name, args.length);
+                  if (m == null) {
+                      return null;
+                  }
+                  try {
+                      return m.invoke(target, args);
+                  } catch (ReflectiveOperationException | RuntimeException ex) {
+                      return null;
+                  }
+              }
+          }
+          WOLFPLUS_EOF
+          cat > 'src/main/java/com/wolfplus/PetKind.java' <<'WOLFPLUS_EOF'
+          package com.wolfplus;
+
+          import com.wolfplus.mixin.WolfAccess;
+          import java.lang.reflect.Method;
+          import java.util.List;
+          import java.util.Locale;
+          import net.minecraft.core.Holder;
+          import net.minecraft.core.registries.BuiltInRegistries;
+          import net.minecraft.core.registries.Registries;
+          import net.minecraft.resources.Identifier;
+          import net.minecraft.resources.ResourceKey;
+          import net.minecraft.world.entity.Entity;
+          import net.minecraft.world.entity.Mob;
+          import net.minecraft.world.entity.OwnableEntity;
+          import net.minecraft.world.entity.TamableAnimal;
+          import net.minecraft.world.entity.animal.wolf.Wolf;
+          import net.minecraft.world.entity.player.Player;
+          import net.minecraft.world.item.DyeColor;
+
+          /**
+           * Какие питомцы поддерживает мод: волк, кошка и кролик.
+           *
+           * Волк и кошка - обычные TamableAnimal. Кролик приручается другим модом (Rabbit Taming):
+           * он добавляет кролику хозяина (OwnableEntity), сидение и ошейник. Без того мода кролик
+           * не считается питомцем, и Wolf Taming+ его не трогает.
+           */
+          public enum PetKind {
+              WOLF("minecraft:wolf", "wolfplus.variant."),
+              CAT("minecraft:cat", "wolfplus.variant.cat."),
+              RABBIT("minecraft:rabbit", "wolfplus.variant.rabbit.");
+
+              /** Породы кошек (ванильные ключи cat_variant). */
+              public static final List<String> CAT_VARIANTS = List.of(
+                      "tabby", "black", "red", "siamese", "british_shorthair", "calico",
+                      "persian", "ragdoll", "white", "jellie", "all_black");
+
+              /** Окрасы кроликов (без убийцы-кролика). Имена совпадают с константами Rabbit.Variant. */
+              public static final List<String> RABBIT_VARIANTS = List.of(
+                      "brown", "white", "black", "white_splotched", "gold", "salt");
+
+              /** Id типа сущности в реестре. */
+              public final String typeId;
+              private final String langPrefix;
+
+              PetKind(String typeId, String langPrefix) {
+                  this.typeId = typeId;
+                  this.langPrefix = langPrefix;
+              }
+
+              // ------------------------------------------------------------ определение вида
+
+              /** Вид питомца или null, если это не поддерживаемое животное. */
+              public static PetKind of(Entity e) {
+                  if (!(e instanceof Mob)) {
+                      return null;
+                  }
+                  String id = String.valueOf(BuiltInRegistries.ENTITY_TYPE.getKey(e.getType()));
+                  for (PetKind k : values()) {
+                      if (!k.typeId.equals(id)) {
+                          continue;
+                      }
+                      if (k == WOLF && !(e instanceof Wolf)) {
+                          return null;
+                      }
+                      if (k == CAT && !(e instanceof TamableAnimal)) {
+                          return null;
+                      }
+                      if (k == RABBIT && !(e instanceof OwnableEntity)) {
+                          return null; // мода приручения кроликов нет
+                      }
+                      return k;
+                  }
+                  return null;
+              }
+
+              public static PetKind fromOrdinal(int i) {
+                  PetKind[] all = values();
+                  return i >= 0 && i < all.length ? all[i] : WOLF;
+              }
+
+              /** Приручён ли питомец. */
+              public static boolean isTamed(Entity e) {
+                  if (e instanceof TamableAnimal t) {
+                      return t.isTame();
+                  }
+                  return e instanceof OwnableEntity o && o.getOwnerReference() != null;
+              }
+
+              /** Принадлежит ли питомец этому игроку. */
+              public static boolean isOwnedBy(Entity e, Player player) {
+                  if (e instanceof TamableAnimal t) {
+                      return t.isOwnedBy(player);
+                  }
+                  if (e instanceof OwnableEntity o) {
+                      var ref = o.getOwnerReference();
+                      return ref != null && ref.getUUID().equals(player.getUUID());
+                  }
+                  return false;
+              }
+
+              // ------------------------------------------------------------ породы
+
+              /** Есть ли у этого питомца выбор породы. */
+              public boolean hasVariants(Entity e) {
+                  return switch (this) {
+                      case WOLF, CAT -> true;
+                      case RABBIT -> rabbitSetter(e) != null;
+                  };
+              }
+
+              public List<String> variants() {
+                  return switch (this) {
+                      case WOLF -> WolfOptions.VARIANTS;
+                      case CAT -> CAT_VARIANTS;
+                      case RABBIT -> RABBIT_VARIANTS;
+                  };
+              }
+
+              /** Ключ перевода названия породы по индексу. */
+              public String variantKey(int index) {
+                  List<String> list = variants();
+                  return this.langPrefix + list.get(Math.floorMod(index, list.size()));
+              }
+
+              public int variantIndexOf(Entity e) {
+                  return switch (this) {
+                      case WOLF -> WolfOptions.variantIndexOf((Wolf) e);
+                      case CAT -> Math.max(0, CAT_VARIANTS.indexOf(catVariantName(e)));
+                      case RABBIT -> Math.max(0, RABBIT_VARIANTS.indexOf(rabbitVariantName(e)));
+                  };
+              }
+
+              public void applyVariant(Entity e, int index) {
+                  List<String> list = variants();
+                  if (index < 0 || index >= list.size()) {
+                      return;
+                  }
+                  switch (this) {
+                      case WOLF -> WolfOptions.applyVariant((Wolf) e, index);
+                      case CAT -> {
+                          var lookup = e.level().registryAccess().lookupOrThrow(Registries.CAT_VARIANT);
+                          lookup.get(ResourceKey.create(Registries.CAT_VARIANT,
+                                          Identifier.withDefaultNamespace(list.get(index))))
+                                  .ifPresent(holder -> Reflect.call(e, "setVariant", holder));
+                      }
+                      case RABBIT -> {
+                          Method setter = rabbitSetter(e);
+                          if (setter == null) {
+                              return;
+                          }
+                          for (Object constant : setter.getParameterTypes()[0].getEnumConstants()) {
+                              if (((Enum<?>) constant).name().equalsIgnoreCase(list.get(index))) {
+                                  try {
+                                      setter.invoke(e, constant);
+                                  } catch (ReflectiveOperationException | RuntimeException ignored) {
+                                      // порода не применилась - ничего страшного
+                                  }
+                                  return;
+                              }
+                          }
+                      }
+                  }
+              }
+
+              private static String catVariantName(Entity e) {
+                  Object variant = Reflect.call(e, "getVariant");
+                  if (variant instanceof Holder<?> holder) {
+                      return holder.unwrapKey().map(key -> key.identifier().getPath()).orElse("");
+                  }
+                  return "";
+              }
+
+              private static String rabbitVariantName(Entity e) {
+                  Object variant = Reflect.call(e, "getVariant");
+                  return variant instanceof Enum<?> en ? en.name().toLowerCase(Locale.ROOT) : "";
+              }
+
+              /** setVariant(<enum>) у кролика или null, если у этой версии породы устроены иначе. */
+              private static Method rabbitSetter(Entity e) {
+                  Method m = Reflect.find(e.getClass(), "setVariant", 1);
+                  return m != null && m.getParameterTypes()[0].isEnum() ? m : null;
+              }
+
+              // ------------------------------------------------------------ ошейник
+
+              public DyeColor collarOf(Entity e) {
+                  switch (this) {
+                      case WOLF:
+                          return ((Wolf) e).getCollarColor();
+                      case CAT: {
+                          Object c = Reflect.call(e, "getCollarColor");
+                          return c instanceof DyeColor d ? d : DyeColor.RED;
+                      }
+                      default: {
+                          Object c = Reflect.call(e, "rt$getCollar");
+                          int id = c instanceof Integer i ? i : -1;
+                          return id >= 0 ? DyeColor.byId(id) : DyeColor.RED;
+                      }
+                  }
+              }
+
+              public void setCollar(Entity e, DyeColor color) {
+                  switch (this) {
+                      case WOLF -> ((WolfAccess) e).wolfplus$setCollarColor(color);
+                      case CAT -> Reflect.call(e, "setCollarColor", color);
+                      case RABBIT -> Reflect.call(e, "rt$setCollar", color.getId());
+                  }
+              }
+
+              // ------------------------------------------------------------ сидение и расприручение
+
+              /** Заставляет питомца встать (волки/кошки - стандартно, кролик - через мод приручения). */
+              public static void unsit(Entity e) {
+                  if (e instanceof TamableAnimal t) {
+                      t.setOrderedToSit(false);
+                      t.setInSittingPose(false);
+                      return;
+                  }
+                  Reflect.call(e, "rt$setSitting", false);
+              }
+
+              /** Снимает приручение (имя и снаряжение обрабатывает вызывающий код). */
+              public void untame(Entity e) {
+                  if (e instanceof TamableAnimal t) {
+                      t.setOrderedToSit(false);
+                      t.setInSittingPose(false);
+                      t.setOwnerReference(null);
+                      t.setTame(false, true);
+                  } else {
+                      Reflect.call(e, "rt$setSitting", false);
+                      Reflect.call(e, "rt$setOwnerUuid", (Object) null);
+                      Reflect.call(e, "rt$setCollar", -1);
+                  }
+              }
+          }
+          WOLFPLUS_EOF
+          cat > 'src/main/java/com/wolfplus/RideLogic.java' <<'WOLFPLUS_EOF'
+          package com.wolfplus;
+
+          import com.wolfplus.mixin.LivingEntityAccessor;
+          import net.minecraft.tags.FluidTags;
+          import net.minecraft.world.entity.EquipmentSlot;
+          import net.minecraft.world.entity.Mob;
+          import net.minecraft.world.entity.ai.attributes.Attributes;
+          import net.minecraft.world.entity.player.Player;
+          import net.minecraft.world.item.Items;
+          import net.minecraft.world.phys.Vec3;
+
+          /**
+           * Управление питомцем верхом (по образцу свиньи/лошади), общее для волка, кошки и кролика.
+           * Миксины WolfRideMixin / CatRideMixin / RabbitRideMixin только вызывают эти методы.
+           *
+           * Без седла getControllingPassenger() = null: питомец живёт своей жизнью (ИИ), игрок просто едет.
+           * С седлом управляет игрок:
+           *  - WASD, взгляд задаёт направление, спринт ускоряет;
+           *  - прыжок (пробел) и автопрыжок через препятствие в 1 блок;
+           *  - в воде питомец держится на поверхности и плывёт вперёд;
+           *  - двойное нажатие прыжка при надетых элитрах включает/выключает полёт
+           *    (сам режим включает сервер - noGravity; тут только физика и детект нажатий).
+           *
+           * Физика считается на клиенте всадника (как у лошади), поэтому детект пробела тоже клиентский.
+           */
+          public final class RideLogic {
+              /** Начальная скорость прыжка: 0.42 = обычный прыжок игрока (~1.25 блока). */
+              private static final double JUMP_POWER = 0.52;
+
+              /** Окно двойного нажатия, тиков. */
+              private static final long DOUBLE_TAP_TICKS = 8L;
+
+              /** Состояние детекта двойного нажатия (по одному на питомца). */
+              public static final class State {
+                  boolean prevJump;
+                  long lastJumpPress;
+              }
+
+              private RideLogic() {
+              }
+
+              public static boolean isSaddled(Mob mob) {
+                  return !mob.getItemBySlot(EquipmentSlot.SADDLE).isEmpty();
+              }
+
+              public static boolean hasElytra(Mob mob) {
+                  return mob.getItemBySlot(EquipmentSlot.CHEST).is(Items.ELYTRA);
+              }
+
+              public static boolean isFlying(Mob mob) {
+                  return mob.isNoGravity() && hasElytra(mob);
+              }
+
+              public static void tick(Mob mob, Player player, State state) {
+                  boolean flying = isFlying(mob);
+
+                  // Нажатия пробела читаем только на клиенте всадника.
+                  boolean jump = false;
+                  if (mob.level().isClientSide()) {
+                      jump = ((LivingEntityAccessor) player).wolfplus$isJumping();
+                      if (jump && !state.prevJump) {
+                          long now = mob.level().getGameTime();
+                          if (now - state.lastJumpPress <= DOUBLE_TAP_TICKS && (flying || hasElytra(mob))) {
+                              WolfFlightHooks.CLIENT_TOGGLE.accept(mob.getId());
+                              state.lastJumpPress = 0L;
+                          } else {
+                              state.lastJumpPress = now;
+                          }
+                      }
+                      state.prevJump = jump;
+                  }
+
+                  // Питомец смотрит туда же, куда игрок (в полёте - ещё и вверх/вниз).
+                  mob.setYRot(player.getYRot() % 360.0F);
+                  mob.setXRot((flying ? player.getXRot() : player.getXRot() * 0.5F) % 360.0F);
+                  mob.yRotO = mob.yBodyRot = mob.yHeadRot = mob.getYRot();
+
+                  Vec3 motion = mob.getDeltaMovement();
+
+                  if (flying) {
+                      // Свободный полёт: куда смотрим, туда и летим.
+                      Vec3 look = player.getLookAngle();
+                      if (player.zza > 0.0F) {
+                          mob.setDeltaMovement(look.scale(player.isSprinting() ? 1.1 : 0.7));
+                      } else if (player.zza < 0.0F) {
+                          mob.setDeltaMovement(look.scale(-0.25));
+                      } else {
+                          mob.setDeltaMovement(motion.scale(0.85));
+                      }
+                      return;
+                  }
+
+                  if (mob.isInWater()) {
+                      // Держимся на поверхности (пробел - всплыть выше) и плывём вперёд.
+                      double y = motion.y;
+                      if (mob.getFluidHeight(FluidTags.WATER) > 0.4) {
+                          y = Math.min(y + 0.04, 0.12);
+                      }
+                      if (jump) {
+                          y = Math.min(y + 0.04, 0.2);
+                      }
+                      double yaw = Math.toRadians(mob.getYRot());
+                      double sin = Math.sin(yaw);
+                      double cos = Math.cos(yaw);
+                      double forward = player.zza * (player.isSprinting() ? 0.07 : 0.05);
+                      double side = player.xxa * 0.03;
+                      mob.setDeltaMovement(
+                              motion.x + side * cos - forward * sin,
+                              y,
+                              motion.z + forward * cos + side * sin);
+                      return;
+                  }
+
+                  if (mob.onGround()) {
+                      if (jump) {
+                          mob.setDeltaMovement(motion.x, JUMP_POWER, motion.z);
+                      } else if (player.zza > 0.0F && mob.horizontalCollision) {
+                          // Автопрыжок через препятствие высотой в блок.
+                          mob.setDeltaMovement(motion.x, 0.42, motion.z);
+                      }
+                  }
+              }
+
+              public static Vec3 input(Mob mob, Player player) {
+                  if (isFlying(mob)) {
+                      return Vec3.ZERO; // скорость в полёте задаём напрямую в tick()
+                  }
+                  float sideways = player.xxa * 0.5F;
+                  float forward = player.zza;
+                  if (forward <= 0.0F) {
+                      forward *= 0.25F;
+                  }
+                  return new Vec3(sideways, 0.0, forward);
+              }
+
+              public static float speed(Mob mob, Player player) {
+                  float speed = (float) mob.getAttributeValue(Attributes.MOVEMENT_SPEED);
+                  return player.isSprinting() ? speed * 1.4F : speed;
+              }
+          }
+          WOLFPLUS_EOF
           cat > 'src/main/java/com/wolfplus/WolfPlus.java' <<'WOLFPLUS_EOF'
           package com.wolfplus;
 
@@ -556,11 +1078,9 @@ jobs:
               }
           }
           WOLFPLUS_EOF
-          mkdir -p 'src/main/java/com/wolfplus'
           cat > 'src/main/java/com/wolfplus/WolfTaming.java' <<'WOLFPLUS_EOF'
           package com.wolfplus;
 
-          import com.wolfplus.mixin.WolfAccess;
           import com.wolfplus.net.MountWolfPayload;
           import com.wolfplus.net.OpenWolfMenuPayload;
           import com.wolfplus.net.UntameWolfPayload;
@@ -571,12 +1091,14 @@ jobs:
           import java.util.Map;
           import java.util.Set;
           import java.util.UUID;
+          import net.fabricmc.fabric.api.event.Event;
           import net.fabricmc.fabric.api.event.lifecycle.v1.ServerEntityEvents;
           import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
           import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
           import net.fabricmc.fabric.api.event.player.UseEntityCallback;
           import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
           import net.minecraft.network.chat.Component;
+          import net.minecraft.resources.Identifier;
           import net.minecraft.server.MinecraftServer;
           import net.minecraft.server.level.ServerLevel;
           import net.minecraft.server.level.ServerPlayer;
@@ -586,7 +1108,8 @@ jobs:
           import net.minecraft.world.effect.MobEffects;
           import net.minecraft.world.entity.Entity;
           import net.minecraft.world.entity.EquipmentSlot;
-          import net.minecraft.world.entity.animal.wolf.Wolf;
+          import net.minecraft.world.entity.Mob;
+          import net.minecraft.world.entity.TamableAnimal;
           import net.minecraft.world.entity.player.Player;
           import net.minecraft.world.item.DyeColor;
           import net.minecraft.world.item.Item;
@@ -596,20 +1119,21 @@ jobs:
           import net.minecraft.world.phys.EntityHitResult;
 
           /**
-           * Вся серверная логика мода.
+           * Вся серверная логика мода. Работает с волками, кошками и (если стоит мод приручения кроликов) кроликами.
            *
-           * Приручение работает через "очки приручения" (нужно набрать {@link #NEEDED}):
-           *  - кость даёт 5 или 10 очков  -> приручение за 1-2 кости, гарантированно не больше 2;
-           *  - кусок мяса даёт 2-4 очка   -> приручение за 3-5 кусков, гарантированно не больше 5;
+           * Приручение диких волков и кошек работает через "очки приручения" (нужно набрать {@link #NEEDED}):
+           *  - кость (волк) / сырая рыба (кошка) даёт 5 или 10 очков -> приручение за 1-2 штуки;
+           *  - мясо (волк) / жареная рыба (кошка) даёт 2-4 очка      -> приручение за 3-5 штук;
            *  - смешанное кормление тоже суммируется.
+           * Кроликов приручает отдельный мод (морковью); здесь они получают меню, седло, элитры и полёт.
            *
            * Верховая езда:
-           *  - Shift + удар по своему волку -> посадка (срабатывает, когда игрок отпустит Shift,
+           *  - Shift + удар по своему питомцу -> посадка (срабатывает, когда игрок отпустит Shift,
            *    иначе игру сразу бы ссадило: Shift = слезть);
            *  - седло надевается ПКМ, элитры тоже ПКМ; ножницы снимают седло, Shift + ножницы - элитры;
-           *  - без седла волк идёт сам, с седлом - им управляет игрок (логика в WolfRideMixin);
+           *  - без седла питомец идёт сам, с седлом - им управляет игрок (логика в RideLogic);
            *  - двойное нажатие прыжка верхом (седло + элитры) включает/выключает полёт.
-           *    Режим полёта = noGravity у волка; сервер следит за ним в {@link #tickFlights}.
+           *    Режим полёта = noGravity у питомца; сервер следит за ним в {@link #tickFlights}.
            */
           public final class WolfTaming {
               private static final int NEEDED = 10;
@@ -618,13 +1142,13 @@ jobs:
               /** Сколько тиков ждём, пока игрок отпустит Shift, прежде чем отменить посадку. */
               private static final int MOUNT_WAIT_TICKS = 60;
 
-              /** Прогресс приручения диких волков. Сбрасывается при остановке сервера. */
+              /** Прогресс приручения диких питомцев. Сбрасывается при остановке сервера. */
               private static final Map<UUID, Integer> PROGRESS = new HashMap<>();
 
-              /** Ожидающие посадки: игрок -> волк. */
+              /** Ожидающие посадки: игрок -> питомец. */
               private static final Map<UUID, PendingMount> PENDING_MOUNTS = new HashMap<>();
 
-              /** Летящие волки (по UUID волка). */
+              /** Летящие питомцы (по UUID питомца). */
               private static final Map<UUID, FlightState> FLIGHTS = new HashMap<>();
 
               /** Любое мясо (плюс всё, что ванилла считает едой для волка). */
@@ -636,12 +1160,19 @@ jobs:
                       Items.RABBIT, Items.COOKED_RABBIT,
                       Items.ROTTEN_FLESH);
 
+              /** Сырая рыба: "сильное" угощение для кошки (как кость для волка). */
+              private static final Set<Item> FISH = Set.of(Items.COD, Items.SALMON);
+
+              /** Жареная рыба: "слабое" угощение для кошки (как мясо для волка). */
+              private static final Set<Item> COOKED_FISH = Set.of(
+                      Items.COOKED_COD, Items.COOKED_SALMON, Items.TROPICAL_FISH);
+
               private static final class PendingMount {
-                  final int wolfId;
+                  final int petId;
                   int ticksLeft = MOUNT_WAIT_TICKS;
 
-                  PendingMount(int wolfId) {
-                      this.wolfId = wolfId;
+                  PendingMount(int petId) {
+                      this.petId = petId;
                   }
               }
 
@@ -653,7 +1184,12 @@ jobs:
               }
 
               public static void register() {
-                  UseEntityCallback.EVENT.register(WolfTaming::onUse);
+                  // Наш обработчик идёт раньше остальных модов: Shift + ПКМ пустой рукой должен открывать меню,
+                  // а не переключать сидение (его делает мод приручения кроликов).
+                  Identifier early = WolfPlus.id("early");
+                  UseEntityCallback.EVENT.addPhaseOrdering(early, Event.DEFAULT_PHASE);
+                  UseEntityCallback.EVENT.register(early, WolfTaming::onUse);
+
                   ServerTickEvents.END_SERVER_TICK.register(server -> {
                       tickPendingMounts(server);
                       tickFlights(server);
@@ -664,32 +1200,33 @@ jobs:
                       FLIGHTS.clear();
                   });
 
-                  // Волк, сохранённый в полёте (noGravity), после загрузки не должен висеть в воздухе.
+                  // Питомец, сохранённый в полёте (noGravity), после загрузки не должен висеть в воздухе.
                   ServerEntityEvents.ENTITY_LOAD.register((entity, world) -> {
-                      if (entity instanceof Wolf wolf && wolf.isNoGravity() && !FLIGHTS.containsKey(wolf.getUUID())) {
-                          wolf.setNoGravity(false);
+                      if (entity instanceof Mob mob && mob.isNoGravity() && PetKind.of(mob) != null
+                              && !FLIGHTS.containsKey(mob.getUUID())) {
+                          mob.setNoGravity(false);
                       }
                   });
 
                   ServerPlayNetworking.registerGlobalReceiver(WolfSettingsPayload.TYPE, (payload, context) -> {
-                      Wolf wolf = findOwnedWolf(context.player(), payload.entityId());
-                      if (wolf != null) {
-                          applySettings(wolf, payload);
+                      Mob pet = findOwnedPet(context.player(), payload.entityId());
+                      if (pet != null) {
+                          applySettings(pet, payload);
                       }
                   });
 
                   ServerPlayNetworking.registerGlobalReceiver(UntameWolfPayload.TYPE, (payload, context) -> {
-                      Wolf wolf = findOwnedWolf(context.player(), payload.entityId());
-                      if (wolf != null) {
-                          untame(wolf, context.player());
+                      Mob pet = findOwnedPet(context.player(), payload.entityId());
+                      if (pet != null) {
+                          untame(pet, context.player());
                       }
                   });
 
                   ServerPlayNetworking.registerGlobalReceiver(MountWolfPayload.TYPE, (payload, context) -> {
                       ServerPlayer player = context.player();
-                      Wolf wolf = findOwnedWolf(player, payload.entityId());
-                      if (wolf != null && !player.isPassenger() && !player.isSpectator()) {
-                          PENDING_MOUNTS.put(player.getUUID(), new PendingMount(wolf.getId()));
+                      Mob pet = findOwnedPet(player, payload.entityId());
+                      if (pet != null && !player.isPassenger() && !player.isSpectator()) {
+                          PENDING_MOUNTS.put(player.getUUID(), new PendingMount(pet.getId()));
                       }
                   });
 
@@ -701,27 +1238,30 @@ jobs:
 
               private static InteractionResult onUse(Player player, Level level, InteractionHand hand, Entity entity,
                       EntityHitResult hitResult) {
-                  if (!(entity instanceof Wolf wolf) || player.isSpectator()) {
+                  PetKind kind = PetKind.of(entity);
+                  if (kind == null || player.isSpectator()) {
                       return InteractionResult.PASS;
                   }
+                  Mob pet = (Mob) entity;
 
                   boolean client = level.isClientSide();
                   InteractionResult handled = client ? InteractionResult.SUCCESS : InteractionResult.SUCCESS_SERVER;
                   ItemStack stack = player.getItemInHand(hand);
 
-                  if (wolf.isTame()) {
-                      if (wolf.isOwnedBy(player)) {
-                          // Надеть седло / элитры (взрослому волку)
-                          if (!wolf.isBaby()) {
+                  if (PetKind.isTamed(pet)) {
+                      boolean mine = PetKind.isOwnedBy(pet, player);
+                      if (mine) {
+                          // Надеть седло / элитры (взрослому питомцу)
+                          if (!pet.isBaby()) {
                               EquipmentSlot slot = null;
                               if (stack.is(Items.SADDLE)) {
                                   slot = EquipmentSlot.SADDLE;
                               } else if (stack.is(Items.ELYTRA)) {
                                   slot = EquipmentSlot.CHEST;
                               }
-                              if (slot != null && !hasGear(wolf, slot)) {
+                              if (slot != null && !hasGear(pet, slot)) {
                                   if (!client) {
-                                      wolf.setItemSlot(slot, stack.copyWithCount(1));
+                                      pet.setItemSlot(slot, stack.copyWithCount(1));
                                       stack.consume(1, player);
                                   }
                                   return handled;
@@ -730,10 +1270,10 @@ jobs:
                           // Снять: ножницы -> седло, Shift + ножницы -> элитры
                           if (stack.is(Items.SHEARS)) {
                               EquipmentSlot slot = player.isShiftKeyDown() ? EquipmentSlot.CHEST : EquipmentSlot.SADDLE;
-                              if (hasGear(wolf, slot)) {
+                              if (hasGear(pet, slot)) {
                                   if (!client) {
-                                      ItemStack gear = wolf.getItemBySlot(slot).copy();
-                                      wolf.setItemSlot(slot, ItemStack.EMPTY);
+                                      ItemStack gear = pet.getItemBySlot(slot).copy();
+                                      pet.setItemSlot(slot, ItemStack.EMPTY);
                                       giveOrDrop(player, gear);
                                       stack.hurtAndBreak(1, player,
                                               hand == InteractionHand.MAIN_HAND ? EquipmentSlot.MAINHAND : EquipmentSlot.OFFHAND);
@@ -743,65 +1283,80 @@ jobs:
                           }
                       }
 
-                      // Shift + ПКМ пустой рукой по своему волку -> меню настройки / расприручения
-                      if (hand == InteractionHand.MAIN_HAND && stack.isEmpty() && player.isShiftKeyDown()
-                              && wolf.isOwnedBy(player)) {
+                      // Shift + ПКМ пустой рукой по своему питомцу -> меню настройки / расприручения
+                      if (hand == InteractionHand.MAIN_HAND && stack.isEmpty() && player.isShiftKeyDown() && mine) {
                           if (!client && player instanceof ServerPlayer serverPlayer) {
-                              openMenu(serverPlayer, wolf, false);
+                              openMenu(serverPlayer, pet, false);
                           }
                           return handled;
                       }
                       return InteractionResult.PASS; // всё остальное - как в ванилле
                   }
 
-                  // Дикий волк: кость или мясо
-                  boolean bone = stack.is(Items.BONE);
-                  if (!bone && !isMeat(wolf, stack)) {
+                  // Дикий кролик приручается другим модом (морковью) - не мешаем
+                  if (kind == PetKind.RABBIT) {
                       return InteractionResult.PASS;
                   }
-                  if (wolf.getTarget() == player) {
-                      return InteractionResult.PASS; // волк злится на этого игрока - так его не приручить
+
+                  // Дикий волк или кошка: "сильное" или "слабое" угощение
+                  TamableAnimal tamable = (TamableAnimal) pet;
+                  boolean strong;
+                  boolean food;
+                  if (kind == PetKind.WOLF) {
+                      strong = stack.is(Items.BONE);
+                      food = strong || isMeat(tamable, stack);
+                  } else {
+                      strong = FISH.contains(stack.getItem());
+                      food = strong || COOKED_FISH.contains(stack.getItem())
+                              || (!stack.isEmpty() && tamable.isFood(stack));
+                  }
+                  if (!food) {
+                      return InteractionResult.PASS;
+                  }
+                  if (pet.getTarget() == player) {
+                      return InteractionResult.PASS; // питомец злится на этого игрока - так его не приручить
                   }
 
                   if (!client && player instanceof ServerPlayer serverPlayer) {
-                      feed(serverPlayer, wolf, stack, bone);
+                      feed(serverPlayer, pet, stack, strong);
                   }
                   return handled;
               }
 
-              private static boolean isMeat(Wolf wolf, ItemStack stack) {
+              private static boolean isMeat(TamableAnimal wolf, ItemStack stack) {
                   return !stack.isEmpty() && (MEAT.contains(stack.getItem()) || wolf.isFood(stack));
               }
 
-              private static void feed(ServerPlayer player, Wolf wolf, ItemStack stack, boolean bone) {
-                  var random = wolf.getRandom();
+              private static void feed(ServerPlayer player, Mob pet, ItemStack stack, boolean strong) {
+                  var random = pet.getRandom();
                   stack.consume(1, player);
 
-                  int gain = bone ? (random.nextBoolean() ? 5 : 10) : 2 + random.nextInt(3);
-                  int total = PROGRESS.merge(wolf.getUUID(), gain, Integer::sum);
-                  Level level = wolf.level();
+                  int gain = strong ? (random.nextBoolean() ? 5 : 10) : 2 + random.nextInt(3);
+                  int total = PROGRESS.merge(pet.getUUID(), gain, Integer::sum);
+                  Level level = pet.level();
 
                   if (total >= NEEDED) {
-                      PROGRESS.remove(wolf.getUUID());
-                      wolf.tame(player);
-                      wolf.getNavigation().stop();
-                      wolf.setTarget(null);
-                      wolf.setOrderedToSit(true);
-                      level.broadcastEntityEvent(wolf, (byte) 7); // сердечки
-                      openMenu(player, wolf, true);
+                      PROGRESS.remove(pet.getUUID());
+                      TamableAnimal tamable = (TamableAnimal) pet;
+                      tamable.tame(player);
+                      pet.getNavigation().stop();
+                      pet.setTarget(null);
+                      tamable.setOrderedToSit(true);
+                      level.broadcastEntityEvent(pet, (byte) 7); // сердечки
+                      openMenu(player, pet, true);
                   } else {
-                      level.broadcastEntityEvent(wolf, (byte) 6); // дымок: пока не вышло
+                      level.broadcastEntityEvent(pet, (byte) 6); // дымок: пока не вышло
                   }
               }
 
               // ---------------------------------------------------------------- снаряжение
 
-              private static boolean hasGear(Wolf wolf, EquipmentSlot slot) {
-                  return !wolf.getItemBySlot(slot).isEmpty();
+              private static boolean hasGear(Mob pet, EquipmentSlot slot) {
+                  return !pet.getItemBySlot(slot).isEmpty();
               }
 
-              private static boolean elytraUsable(Wolf wolf) {
-                  ItemStack elytra = wolf.getItemBySlot(EquipmentSlot.CHEST);
+              private static boolean elytraUsable(Mob pet) {
+                  ItemStack elytra = pet.getItemBySlot(EquipmentSlot.CHEST);
                   return elytra.is(Items.ELYTRA) && elytra.getMaxDamage() - elytra.getDamageValue() > 1;
               }
 
@@ -814,8 +1369,8 @@ jobs:
               // ---------------------------------------------------------------- верховая езда
 
               /**
-               * Садим игрока на волка, как только он отпустит Shift
-               * (пока Shift зажат, игрок на волке не удержится - ванилла сразу ссаживает).
+               * Садим игрока на питомца, как только он отпустит Shift
+               * (пока Shift зажат, игрок не удержится - ванилла сразу ссаживает).
                */
               private static void tickPendingMounts(MinecraftServer server) {
                   if (PENDING_MOUNTS.isEmpty()) {
@@ -835,12 +1390,11 @@ jobs:
                           continue; // ждём, пока отпустит
                       }
 
-                      Wolf wolf = findOwnedWolf(player, pending.wolfId);
-                      if (wolf != null && !wolf.isVehicle()) {
-                          wolf.setOrderedToSit(false);
-                          wolf.setInSittingPose(false);
-                          wolf.getNavigation().stop();
-                          player.startRiding(wolf);
+                      Mob pet = findOwnedPet(player, pending.petId);
+                      if (pet != null && !pet.isVehicle()) {
+                          PetKind.unsit(pet);
+                          pet.getNavigation().stop();
+                          player.startRiding(pet);
                       }
                       it.remove();
                   }
@@ -848,41 +1402,42 @@ jobs:
 
               // ---------------------------------------------------------------- полёт
 
-              /** Двойной прыжок на волке: включить или выключить полёт. */
+              /** Двойной прыжок верхом: включить или выключить полёт. */
               private static void toggleFlight(ServerPlayer player, int entityId) {
                   Entity entity = player.level().getEntity(entityId);
-                  if (!(entity instanceof Wolf wolf)
-                          || player.getVehicle() != wolf
-                          || !wolf.isOwnedBy(player)
-                          || !hasGear(wolf, EquipmentSlot.SADDLE)) {
+                  if (!(entity instanceof Mob pet)
+                          || PetKind.of(pet) == null
+                          || player.getVehicle() != pet
+                          || !PetKind.isOwnedBy(pet, player)
+                          || !hasGear(pet, EquipmentSlot.SADDLE)) {
                       return;
                   }
-                  if (FLIGHTS.containsKey(wolf.getUUID())) {
-                      FLIGHTS.remove(wolf.getUUID());
-                      stopFlight(wolf);
+                  if (FLIGHTS.containsKey(pet.getUUID())) {
+                      FLIGHTS.remove(pet.getUUID());
+                      stopFlight(pet);
                       return;
                   }
-                  if (!elytraUsable(wolf)) {
+                  if (!elytraUsable(pet)) {
                       return;
                   }
-                  FLIGHTS.put(wolf.getUUID(), new FlightState());
-                  wolf.setNoGravity(true);
-                  wolf.resetFallDistance();
+                  FLIGHTS.put(pet.getUUID(), new FlightState());
+                  pet.setNoGravity(true);
+                  pet.resetFallDistance();
               }
 
-              private static void stopFlight(Wolf wolf) {
-                  wolf.setNoGravity(false);
-                  wolf.resetFallDistance();
-                  if (!wolf.onGround()) {
+              private static void stopFlight(Mob pet) {
+                  pet.setNoGravity(false);
+                  pet.resetFallDistance();
+                  if (!pet.onGround()) {
                       // Мягкая посадка, если выключили полёт в воздухе.
-                      wolf.addEffect(new MobEffectInstance(MobEffects.SLOW_FALLING, 80, 0, false, false));
+                      pet.addEffect(new MobEffectInstance(MobEffects.SLOW_FALLING, 80, 0, false, false));
                   }
               }
 
-              private static Wolf findWolf(MinecraftServer server, UUID uuid) {
+              private static Mob findPet(MinecraftServer server, UUID uuid) {
                   for (ServerLevel level : server.getAllLevels()) {
-                      if (level.getEntity(uuid) instanceof Wolf wolf) {
-                          return wolf;
+                      if (level.getEntity(uuid) instanceof Mob mob && PetKind.of(mob) != null) {
+                          return mob;
                       }
                   }
                   return null;
@@ -896,96 +1451,108 @@ jobs:
                   while (it.hasNext()) {
                       Map.Entry<UUID, FlightState> entry = it.next();
                       FlightState state = entry.getValue();
-                      Wolf wolf = findWolf(server, entry.getKey());
-                      if (wolf == null) {
+                      Mob pet = findPet(server, entry.getKey());
+                      if (pet == null) {
                           it.remove();
                           continue;
                       }
 
                       state.ticks++;
-                      boolean ok = wolf.isAlive()
-                              && hasGear(wolf, EquipmentSlot.SADDLE)
-                              && elytraUsable(wolf)
-                              && wolf.getControllingPassenger() instanceof ServerPlayer;
-                      if (ok && state.ticks > 10 && wolf.onGround()) {
+                      boolean ok = pet.isAlive()
+                              && hasGear(pet, EquipmentSlot.SADDLE)
+                              && elytraUsable(pet)
+                              && pet.getControllingPassenger() instanceof ServerPlayer;
+                      if (ok && state.ticks > 10 && pet.onGround()) {
                           ok = false; // приземлились
                       }
                       if (!ok) {
                           it.remove();
-                          stopFlight(wolf);
+                          stopFlight(pet);
                           continue;
                       }
 
-                      wolf.resetFallDistance();
+                      pet.resetFallDistance();
                       if (state.ticks % 20 == 0) {
                           // Элитры изнашиваются, как у игрока: 1 прочность в секунду.
-                          wolf.getItemBySlot(EquipmentSlot.CHEST).hurtAndBreak(1, wolf, EquipmentSlot.CHEST);
+                          pet.getItemBySlot(EquipmentSlot.CHEST).hurtAndBreak(1, pet, EquipmentSlot.CHEST);
                       }
                   }
               }
 
               // ---------------------------------------------------------------- меню
 
-              private static void openMenu(ServerPlayer player, Wolf wolf, boolean firstTime) {
-                  String name = wolf.hasCustomName() ? wolf.getCustomName().getString() : "";
+              private static void openMenu(ServerPlayer player, Mob pet, boolean firstTime) {
+                  PetKind kind = PetKind.of(pet);
+                  if (kind == null) {
+                      return;
+                  }
+                  String name = pet.hasCustomName() ? pet.getCustomName().getString() : "";
+                  int variant = kind.hasVariants(pet) ? kind.variantIndexOf(pet) : -1;
                   ServerPlayNetworking.send(player, new OpenWolfMenuPayload(
-                          wolf.getId(),
+                          pet.getId(),
                           firstTime,
                           name,
-                          WolfOptions.variantIndexOf(wolf),
-                          wolf.getCollarColor().getId()));
+                          variant,
+                          kind.collarOf(pet).getId(),
+                          kind.ordinal()));
               }
 
-              /** Волк, который существует, приручён, принадлежит игроку и находится рядом. Иначе null. */
-              private static Wolf findOwnedWolf(ServerPlayer player, int entityId) {
+              /** Питомец, который существует, приручён, принадлежит игроку и находится рядом. Иначе null. */
+              private static Mob findOwnedPet(ServerPlayer player, int entityId) {
                   Entity entity = player.level().getEntity(entityId);
-                  if (entity instanceof Wolf wolf
-                          && wolf.isTame()
-                          && wolf.isOwnedBy(player)
-                          && wolf.distanceToSqr(player) <= MAX_DISTANCE_SQ) {
-                      return wolf;
+                  if (entity instanceof Mob pet
+                          && PetKind.of(pet) != null
+                          && PetKind.isTamed(pet)
+                          && PetKind.isOwnedBy(pet, player)
+                          && pet.distanceToSqr(player) <= MAX_DISTANCE_SQ) {
+                      return pet;
                   }
                   return null;
               }
 
-              private static void applySettings(Wolf wolf, WolfSettingsPayload payload) {
+              private static void applySettings(Mob pet, WolfSettingsPayload payload) {
+                  PetKind kind = PetKind.of(pet);
+                  if (kind == null) {
+                      return;
+                  }
                   String name = payload.name().strip();
                   if (name.length() > WolfOptions.MAX_NAME_LENGTH) {
                       name = name.substring(0, WolfOptions.MAX_NAME_LENGTH);
                   }
-                  wolf.setCustomName(name.isEmpty() ? null : Component.literal(name));
+                  pet.setCustomName(name.isEmpty() ? null : Component.literal(name));
 
-                  WolfOptions.applyVariant(wolf, payload.variantIndex());
+                  kind.applyVariant(pet, payload.variantIndex());
 
                   DyeColor color = DyeColor.byId(payload.colorId());
-                  ((WolfAccess) wolf).wolfplus$setCollarColor(color);
+                  kind.setCollar(pet, color);
               }
 
               // ---------------------------------------------------------------- расприручение
 
-              private static void untame(Wolf wolf, ServerPlayer player) {
-                  // Останавливаем полёт, ссаживаем всадника и возвращаем седло и элитры владельцу.
-                  if (FLIGHTS.remove(wolf.getUUID()) != null) {
-                      wolf.setNoGravity(false);
+              private static void untame(Mob pet, ServerPlayer player) {
+                  PetKind kind = PetKind.of(pet);
+                  if (kind == null) {
+                      return;
                   }
-                  wolf.ejectPassengers();
+                  // Останавливаем полёт, ссаживаем всадника и возвращаем седло и элитры владельцу.
+                  if (FLIGHTS.remove(pet.getUUID()) != null) {
+                      pet.setNoGravity(false);
+                  }
+                  pet.ejectPassengers();
                   for (EquipmentSlot slot : new EquipmentSlot[] {EquipmentSlot.SADDLE, EquipmentSlot.CHEST}) {
-                      ItemStack gear = wolf.getItemBySlot(slot);
+                      ItemStack gear = pet.getItemBySlot(slot);
                       if (!gear.isEmpty()) {
                           ItemStack returned = gear.copy();
-                          wolf.setItemSlot(slot, ItemStack.EMPTY);
+                          pet.setItemSlot(slot, ItemStack.EMPTY);
                           giveOrDrop(player, returned);
                       }
                   }
 
-                  wolf.setOrderedToSit(false);
-                  wolf.setInSittingPose(false);
-                  wolf.setOwnerReference(null);
-                  wolf.setTame(false, true);
-                  wolf.setCustomName(null);
-                  wolf.setTarget(null);
-                  wolf.getNavigation().stop();
-                  wolf.level().broadcastEntityEvent(wolf, (byte) 6);
+                  kind.untame(pet);
+                  pet.setCustomName(null);
+                  pet.setTarget(null);
+                  pet.getNavigation().stop();
+                  pet.level().broadcastEntityEvent(pet, (byte) 6);
               }
           }
           WOLFPLUS_EOF
@@ -1019,73 +1586,31 @@ jobs:
           cat > 'src/main/java/com/wolfplus/mixin/WolfRideMixin.java' <<'WOLFPLUS_EOF'
           package com.wolfplus.mixin;
 
-          import com.wolfplus.WolfFlightHooks;
-          import net.minecraft.tags.FluidTags;
+          import com.wolfplus.RideLogic;
           import net.minecraft.world.entity.EntityType;
-          import net.minecraft.world.entity.EquipmentSlot;
           import net.minecraft.world.entity.LivingEntity;
           import net.minecraft.world.entity.TamableAnimal;
-          import net.minecraft.world.entity.ai.attributes.Attributes;
           import net.minecraft.world.entity.animal.wolf.Wolf;
           import net.minecraft.world.entity.player.Player;
-          import net.minecraft.world.item.Items;
           import net.minecraft.world.level.Level;
           import net.minecraft.world.phys.Vec3;
           import org.spongepowered.asm.mixin.Mixin;
           import org.spongepowered.asm.mixin.Unique;
 
-          /**
-           * Управление волком верхом (по образцу свиньи/лошади).
-           *
-           * Без седла getControllingPassenger() = null: волк живёт своей жизнью (ИИ), игрок просто едет.
-           * С седлом управляет игрок:
-           *  - WASD, взгляд задаёт направление, спринт ускоряет;
-           *  - прыжок (пробел) и автопрыжок через препятствие в 1 блок;
-           *  - в воде волк держится на поверхности и плывёт вперёд;
-           *  - двойное нажатие прыжка при надетых элитрах включает/выключает полёт
-           *    (сам режим включает сервер - noGravity; тут только физика и детект нажатий).
-           *
-           * Физика считается на клиенте всадника (как у лошади), поэтому детект пробела тоже клиентский.
-           */
+          /** Управление волком верхом; вся логика в {@link RideLogic}. */
           @Mixin(Wolf.class)
           public abstract class WolfRideMixin extends TamableAnimal {
-              /** Начальная скорость прыжка: 0.42 = обычный прыжок игрока (~1.25 блока). */
               @Unique
-              private static final double WOLFPLUS_JUMP_POWER = 0.52;
-
-              /** Окно двойного нажатия, тиков. */
-              @Unique
-              private static final long WOLFPLUS_DOUBLE_TAP_TICKS = 8L;
-
-              @Unique
-              private boolean wolfplus$prevJump;
-
-              @Unique
-              private long wolfplus$lastJumpPress;
+              private RideLogic.State wolfplus$ride;
 
               protected WolfRideMixin(EntityType<? extends TamableAnimal> type, Level level) {
                   super(type, level);
               }
 
-              @Unique
-              private boolean wolfplus$isSaddled() {
-                  return !this.getItemBySlot(EquipmentSlot.SADDLE).isEmpty();
-              }
-
-              @Unique
-              private boolean wolfplus$hasElytra() {
-                  return this.getItemBySlot(EquipmentSlot.CHEST).is(Items.ELYTRA);
-              }
-
-              @Unique
-              private boolean wolfplus$isFlying() {
-                  return this.isNoGravity() && this.wolfplus$hasElytra();
-              }
-
               @Override
               public LivingEntity getControllingPassenger() {
                   if (this.getFirstPassenger() instanceof Player player) {
-                      return this.wolfplus$isSaddled() ? player : null;
+                      return RideLogic.isSaddled(this) ? player : null;
                   }
                   return super.getControllingPassenger();
               }
@@ -1093,93 +1618,124 @@ jobs:
               @Override
               protected void tickRidden(Player player, Vec3 travelVector) {
                   super.tickRidden(player, travelVector);
-
-                  boolean flying = this.wolfplus$isFlying();
-
-                  // Нажатия пробела читаем только на клиенте всадника.
-                  boolean jump = false;
-                  if (this.level().isClientSide()) {
-                      jump = ((LivingEntityAccessor) player).wolfplus$isJumping();
-                      if (jump && !this.wolfplus$prevJump) {
-                          long now = this.level().getGameTime();
-                          if (now - this.wolfplus$lastJumpPress <= WOLFPLUS_DOUBLE_TAP_TICKS
-                                  && (flying || this.wolfplus$hasElytra())) {
-                              WolfFlightHooks.CLIENT_TOGGLE.accept(this.getId());
-                              this.wolfplus$lastJumpPress = 0L;
-                          } else {
-                              this.wolfplus$lastJumpPress = now;
-                          }
-                      }
-                      this.wolfplus$prevJump = jump;
+                  if (this.wolfplus$ride == null) {
+                      this.wolfplus$ride = new RideLogic.State();
                   }
-
-                  // Волк смотрит туда же, куда игрок (в полёте - ещё и вверх/вниз).
-                  this.setRot(player.getYRot(), flying ? player.getXRot() : player.getXRot() * 0.5F);
-                  this.yRotO = this.yBodyRot = this.yHeadRot = this.getYRot();
-
-                  Vec3 motion = this.getDeltaMovement();
-
-                  if (flying) {
-                      // Свободный полёт: куда смотрим, туда и летим.
-                      Vec3 look = player.getLookAngle();
-                      if (player.zza > 0.0F) {
-                          this.setDeltaMovement(look.scale(player.isSprinting() ? 1.1 : 0.7));
-                      } else if (player.zza < 0.0F) {
-                          this.setDeltaMovement(look.scale(-0.25));
-                      } else {
-                          this.setDeltaMovement(motion.scale(0.85));
-                      }
-                      return;
-                  }
-
-                  if (this.isInWater()) {
-                      // Держимся на поверхности (пробел - всплыть выше) и плывём вперёд.
-                      double y = motion.y;
-                      if (this.getFluidHeight(FluidTags.WATER) > 0.4) {
-                          y = Math.min(y + 0.04, 0.12);
-                      }
-                      if (jump) {
-                          y = Math.min(y + 0.04, 0.2);
-                      }
-                      double yaw = Math.toRadians(this.getYRot());
-                      double sin = Math.sin(yaw);
-                      double cos = Math.cos(yaw);
-                      double forward = player.zza * (player.isSprinting() ? 0.07 : 0.05);
-                      double side = player.xxa * 0.03;
-                      this.setDeltaMovement(
-                              motion.x + side * cos - forward * sin,
-                              y,
-                              motion.z + forward * cos + side * sin);
-                      return;
-                  }
-
-                  if (this.onGround()) {
-                      if (jump) {
-                          this.setDeltaMovement(motion.x, WOLFPLUS_JUMP_POWER, motion.z);
-                      } else if (player.zza > 0.0F && this.horizontalCollision) {
-                          // Автопрыжок через препятствие высотой в блок.
-                          this.setDeltaMovement(motion.x, 0.42, motion.z);
-                      }
-                  }
+                  RideLogic.tick(this, player, this.wolfplus$ride);
               }
 
               @Override
               protected Vec3 getRiddenInput(Player player, Vec3 travelVector) {
-                  if (this.wolfplus$isFlying()) {
-                      return Vec3.ZERO; // скорость в полёте задаём напрямую в tickRidden
-                  }
-                  float sideways = player.xxa * 0.5F;
-                  float forward = player.zza;
-                  if (forward <= 0.0F) {
-                      forward *= 0.25F;
-                  }
-                  return new Vec3(sideways, 0.0, forward);
+                  return RideLogic.input(this, player);
               }
 
               @Override
               protected float getRiddenSpeed(Player player) {
-                  float speed = (float) this.getAttributeValue(Attributes.MOVEMENT_SPEED);
-                  return player.isSprinting() ? speed * 1.4F : speed;
+                  return RideLogic.speed(this, player);
+              }
+          }
+          WOLFPLUS_EOF
+          cat > 'src/main/java/com/wolfplus/mixin/CatRideMixin.java' <<'WOLFPLUS_EOF'
+          package com.wolfplus.mixin;
+
+          import com.wolfplus.RideLogic;
+          import net.minecraft.world.entity.EntityType;
+          import net.minecraft.world.entity.LivingEntity;
+          import net.minecraft.world.entity.TamableAnimal;
+          import net.minecraft.world.entity.player.Player;
+          import net.minecraft.world.level.Level;
+          import net.minecraft.world.phys.Vec3;
+          import @@Cat@@;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.Unique;
+
+          /** Управление кошкой верхом; вся логика в {@link RideLogic}. */
+          @Mixin(Cat.class)
+          public abstract class CatRideMixin extends TamableAnimal {
+              @Unique
+              private RideLogic.State wolfplus$ride;
+
+              protected CatRideMixin(EntityType<? extends TamableAnimal> type, Level level) {
+                  super(type, level);
+              }
+
+              @Override
+              public LivingEntity getControllingPassenger() {
+                  if (this.getFirstPassenger() instanceof Player player) {
+                      return RideLogic.isSaddled(this) ? player : null;
+                  }
+                  return super.getControllingPassenger();
+              }
+
+              @Override
+              protected void tickRidden(Player player, Vec3 travelVector) {
+                  super.tickRidden(player, travelVector);
+                  if (this.wolfplus$ride == null) {
+                      this.wolfplus$ride = new RideLogic.State();
+                  }
+                  RideLogic.tick(this, player, this.wolfplus$ride);
+              }
+
+              @Override
+              protected Vec3 getRiddenInput(Player player, Vec3 travelVector) {
+                  return RideLogic.input(this, player);
+              }
+
+              @Override
+              protected float getRiddenSpeed(Player player) {
+                  return RideLogic.speed(this, player);
+              }
+          }
+          WOLFPLUS_EOF
+          cat > 'src/main/java/com/wolfplus/mixin/RabbitRideMixin.java' <<'WOLFPLUS_EOF'
+          package com.wolfplus.mixin;
+
+          import com.wolfplus.RideLogic;
+          import net.minecraft.world.entity.EntityType;
+          import net.minecraft.world.entity.LivingEntity;
+          import net.minecraft.world.entity.player.Player;
+          import net.minecraft.world.level.Level;
+          import net.minecraft.world.phys.Vec3;
+          import @@Animal@@;
+          import @@Rabbit@@;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.Unique;
+
+          /** Управление кроликом верхом; вся логика в {@link RideLogic}. */
+          @Mixin(Rabbit.class)
+          public abstract class RabbitRideMixin extends Animal {
+              @Unique
+              private RideLogic.State wolfplus$ride;
+
+              protected RabbitRideMixin(EntityType<? extends Animal> type, Level level) {
+                  super(type, level);
+              }
+
+              @Override
+              public LivingEntity getControllingPassenger() {
+                  if (this.getFirstPassenger() instanceof Player player) {
+                      return RideLogic.isSaddled(this) ? player : null;
+                  }
+                  return super.getControllingPassenger();
+              }
+
+              @Override
+              protected void tickRidden(Player player, Vec3 travelVector) {
+                  super.tickRidden(player, travelVector);
+                  if (this.wolfplus$ride == null) {
+                      this.wolfplus$ride = new RideLogic.State();
+                  }
+                  RideLogic.tick(this, player, this.wolfplus$ride);
+              }
+
+              @Override
+              protected Vec3 getRiddenInput(Player player, Vec3 travelVector) {
+                  return RideLogic.input(this, player);
+              }
+
+              @Override
+              protected float getRiddenSpeed(Player player) {
+                  return RideLogic.speed(this, player);
               }
           }
           WOLFPLUS_EOF
@@ -1193,7 +1749,7 @@ jobs:
           import net.minecraft.network.codec.StreamCodec;
           import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
 
-          /** Клиент -> сервер: игрок хочет сесть на своего волка (Shift + удар). */
+          /** Клиент -> сервер: игрок хочет сесть на своего питомца (Shift + удар). */
           public record MountWolfPayload(int entityId) implements CustomPacketPayload {
 
               public static final CustomPacketPayload.Type<MountWolfPayload> TYPE =
@@ -1220,15 +1776,16 @@ jobs:
           import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
 
           /**
-           * Сервер -> клиент: открыть меню настройки волка.
+           * Сервер -> клиент: открыть меню настройки питомца.
            *
-           * @param firstTime    true, если волка только что приручили
+           * @param firstTime    true, если питомца только что приручили
            * @param name         текущее имя ("" если без имени)
-           * @param variantIndex индекс породы в {@link com.wolfplus.WolfOptions#VARIANTS}
+           * @param variantIndex индекс породы в списке вида питомца; -1, если выбора породы нет
            * @param colorId      id цвета ошейника (DyeColor#getId)
+           * @param kind         вид питомца (порядковый номер в {@link com.wolfplus.PetKind})
            */
-          public record OpenWolfMenuPayload(int entityId, boolean firstTime, String name, int variantIndex, int colorId)
-                  implements CustomPacketPayload {
+          public record OpenWolfMenuPayload(int entityId, boolean firstTime, String name, int variantIndex, int colorId,
+                  int kind) implements CustomPacketPayload {
 
               public static final CustomPacketPayload.Type<OpenWolfMenuPayload> TYPE =
                       new CustomPacketPayload.Type<>(WolfPlus.id("open_menu"));
@@ -1239,6 +1796,7 @@ jobs:
                       ByteBufCodecs.STRING_UTF8, OpenWolfMenuPayload::name,
                       ByteBufCodecs.VAR_INT, OpenWolfMenuPayload::variantIndex,
                       ByteBufCodecs.VAR_INT, OpenWolfMenuPayload::colorId,
+                      ByteBufCodecs.VAR_INT, OpenWolfMenuPayload::kind,
                       OpenWolfMenuPayload::new);
 
               @Override
@@ -1257,7 +1815,7 @@ jobs:
           import net.minecraft.network.codec.StreamCodec;
           import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
 
-          /** Клиент -> сервер: расприручить волка (отправляется только после двух подтверждений в GUI). */
+          /** Клиент -> сервер: расприручить питомца (отправляется только после двух подтверждений в GUI). */
           public record UntameWolfPayload(int entityId) implements CustomPacketPayload {
 
               public static final CustomPacketPayload.Type<UntameWolfPayload> TYPE =
@@ -1283,7 +1841,7 @@ jobs:
           import net.minecraft.network.codec.StreamCodec;
           import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
 
-          /** Клиент -> сервер: применить имя, породу и цвет ошейника. */
+          /** Клиент -> сервер: применить имя, породу (-1 - не менять) и цвет ошейника. */
           public record WolfSettingsPayload(int entityId, String name, int variantIndex, int colorId)
                   implements CustomPacketPayload {
 
@@ -1306,8 +1864,8 @@ jobs:
           mkdir -p 'src/main/resources/assets/wolfplus/lang'
           cat > 'src/main/resources/assets/wolfplus/lang/en_us.json' <<'WOLFPLUS_EOF'
           {
-            "wolfplus.menu.title_new": "Wolf tamed! Customize it",
-            "wolfplus.menu.title": "Wolf settings",
+            "wolfplus.menu.title_new": "Pet tamed! Customize it",
+            "wolfplus.menu.title": "Pet settings",
             "wolfplus.menu.name": "Name",
             "wolfplus.menu.name_hint": "No name",
             "wolfplus.menu.breed_label": "Breed",
@@ -1317,7 +1875,7 @@ jobs:
             "wolfplus.menu.done": "Done",
             "wolfplus.menu.save": "Save",
             "wolfplus.menu.skip": "Skip",
-            "wolfplus.menu.untame": "Untame wolf...",
+            "wolfplus.menu.untame": "Untame pet...",
 
             "wolfplus.variant.pale": "Pale",
             "wolfplus.variant.spotted": "Spotted",
@@ -1329,11 +1887,30 @@ jobs:
             "wolfplus.variant.chestnut": "Chestnut",
             "wolfplus.variant.striped": "Striped",
 
-            "wolfplus.untame.title1": "Untame this wolf?",
+            "wolfplus.variant.cat.tabby": "Tabby",
+            "wolfplus.variant.cat.black": "Tuxedo",
+            "wolfplus.variant.cat.red": "Red",
+            "wolfplus.variant.cat.siamese": "Siamese",
+            "wolfplus.variant.cat.british_shorthair": "British Shorthair",
+            "wolfplus.variant.cat.calico": "Calico",
+            "wolfplus.variant.cat.persian": "Persian",
+            "wolfplus.variant.cat.ragdoll": "Ragdoll",
+            "wolfplus.variant.cat.white": "White",
+            "wolfplus.variant.cat.jellie": "Jellie",
+            "wolfplus.variant.cat.all_black": "All Black",
+
+            "wolfplus.variant.rabbit.brown": "Brown",
+            "wolfplus.variant.rabbit.white": "White",
+            "wolfplus.variant.rabbit.black": "Black",
+            "wolfplus.variant.rabbit.white_splotched": "Splotched",
+            "wolfplus.variant.rabbit.gold": "Gold",
+            "wolfplus.variant.rabbit.salt": "Salt & Pepper",
+
+            "wolfplus.untame.title1": "Untame this pet?",
             "wolfplus.untame.text1": "It will become wild again and will no longer be yours.",
             "wolfplus.untame.yes1": "Yes, untame",
             "wolfplus.untame.title2": "Are you absolutely sure?",
-            "wolfplus.untame.text2": "This cannot be undone. The wolf's name will be reset.",
+            "wolfplus.untame.text2": "This cannot be undone. The pet's name will be reset.",
             "wolfplus.untame.yes2": "Untame for good",
             "wolfplus.untame.no": "Cancel"
           }
@@ -1341,8 +1918,8 @@ jobs:
           mkdir -p 'src/main/resources/assets/wolfplus/lang'
           cat > 'src/main/resources/assets/wolfplus/lang/ru_ru.json' <<'WOLFPLUS_EOF'
           {
-            "wolfplus.menu.title_new": "Волк приручен! Настройте его",
-            "wolfplus.menu.title": "Настройки волка",
+            "wolfplus.menu.title_new": "Питомец приручён! Настройте его",
+            "wolfplus.menu.title": "Настройки питомца",
             "wolfplus.menu.name": "Имя",
             "wolfplus.menu.name_hint": "Без имени",
             "wolfplus.menu.breed_label": "Порода",
@@ -1352,7 +1929,7 @@ jobs:
             "wolfplus.menu.done": "Готово",
             "wolfplus.menu.save": "Сохранить",
             "wolfplus.menu.skip": "Пропустить",
-            "wolfplus.menu.untame": "Расприручить волка...",
+            "wolfplus.menu.untame": "Расприручить питомца...",
 
             "wolfplus.variant.pale": "Бледный",
             "wolfplus.variant.spotted": "Пятнистый",
@@ -1364,11 +1941,30 @@ jobs:
             "wolfplus.variant.chestnut": "Каштановый",
             "wolfplus.variant.striped": "Полосатый",
 
-            "wolfplus.untame.title1": "Расприручить волка?",
+            "wolfplus.variant.cat.tabby": "Табби",
+            "wolfplus.variant.cat.black": "Чёрно-белый",
+            "wolfplus.variant.cat.red": "Рыжий",
+            "wolfplus.variant.cat.siamese": "Сиамский",
+            "wolfplus.variant.cat.british_shorthair": "Британский",
+            "wolfplus.variant.cat.calico": "Калико",
+            "wolfplus.variant.cat.persian": "Персидский",
+            "wolfplus.variant.cat.ragdoll": "Рэгдолл",
+            "wolfplus.variant.cat.white": "Белый",
+            "wolfplus.variant.cat.jellie": "Желе",
+            "wolfplus.variant.cat.all_black": "Чёрный",
+
+            "wolfplus.variant.rabbit.brown": "Коричневый",
+            "wolfplus.variant.rabbit.white": "Белый",
+            "wolfplus.variant.rabbit.black": "Чёрный",
+            "wolfplus.variant.rabbit.white_splotched": "Пятнистый",
+            "wolfplus.variant.rabbit.gold": "Золотой",
+            "wolfplus.variant.rabbit.salt": "Соль с перцем",
+
+            "wolfplus.untame.title1": "Расприручить питомца?",
             "wolfplus.untame.text1": "Он снова станет диким и перестанет быть вашим.",
             "wolfplus.untame.yes1": "Да, расприручить",
             "wolfplus.untame.title2": "Вы точно уверены?",
-            "wolfplus.untame.text2": "Это нельзя отменить. Имя волка будет сброшено.",
+            "wolfplus.untame.text2": "Это нельзя отменить. Имя питомца будет сброшено.",
             "wolfplus.untame.yes2": "Расприручить окончательно",
             "wolfplus.untame.no": "Отмена"
           }
@@ -1380,7 +1976,7 @@ jobs:
             "id": "wolfplus",
             "version": "${version}",
             "name": "Wolf Taming+",
-            "description": "Улучшенное приручение волков: любое мясо, настройка имени, породы и ошейника, гарантированное число кормлений, расприручение, верховая езда (с седлом и без), плавание, прыжок, элитры и полёт.",
+            "description": "Улучшенное приручение волков и кошек (кроликов - вместе с модом Rabbit Taming): любое угощение, настройка имени, породы и ошейника, гарантированное число кормлений, расприручение, верховая езда (с седлом и без), плавание, прыжок, элитры и полёт.",
             "authors": [],
             "license": "MIT",
             "environment": "*",
@@ -1401,6 +1997,9 @@ jobs:
               "minecraft": "~26.2",
               "java": ">=25",
               "fabric-api": "*"
+            },
+            "suggests": {
+              "rabbittame": "*"
             }
           }
           WOLFPLUS_EOF
@@ -1412,6 +2011,8 @@ jobs:
             "compatibilityLevel": "JAVA_25",
             "mixins": [
               "WolfAccess",
+              "CatRideMixin",
+              "RabbitRideMixin",
               "WolfRideMixin",
               "LivingEntityAccessor"
             ],
@@ -1427,11 +2028,11 @@ jobs:
           import java.util.function.IntConsumer;
 
           /**
-           * Мост между общим кодом (миксин волка) и клиентом: миксин не может напрямую
+           * Мост между общим кодом (RideLogic) и клиентом: общий код не может напрямую
            * вызывать клиентский API сети, поэтому клиент подставляет сюда отправку пакета.
            */
           public final class WolfFlightHooks {
-              /** Запрос "переключить полёт у волка с таким entityId". На сервере ничего не делает. */
+              /** Запрос "переключить полёт у питомца с таким entityId". На сервере ничего не делает. */
               public static volatile IntConsumer CLIENT_TOGGLE = id -> {
               };
 
@@ -1449,7 +2050,7 @@ jobs:
           import net.minecraft.network.codec.StreamCodec;
           import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
 
-          /** Клиент -> сервер: двойной прыжок на волке - включить/выключить полёт. */
+          /** Клиент -> сервер: двойной прыжок верхом - включить/выключить полёт. */
           public record WolfFlightPayload(int entityId) implements CustomPacketPayload {
 
               public static final CustomPacketPayload.Type<WolfFlightPayload> TYPE =
@@ -1823,6 +2424,19 @@ jobs:
           with open(out + "/wolf_saddle.png", "wb") as f:
               f.write(png)
           WOLFPLUS_EOF
+
+      - name: Resolve Minecraft class names
+        run: |
+          # Миксины кошки и кролика зависят от путей классов Minecraft 26.2 - находим их автоматически.
+          # Если какой-то путь найти не удалось, соответствующий миксин отключается (езда на этом питомце
+          # будет без управления), а всё остальное собирается как обычно.
+          python3 tools/resolve.py || true
+          for f in $(grep -rl '@@' src || true); do
+            echo "::warning::riding mixin disabled (class path not resolved): $f"
+            b=$(basename "$f" .java)
+            rm -f "$f"
+            sed -i "/\"$b\"/d" src/main/resources/wolfplus.mixins.json
+          done
 
       - name: Build
         run: |
