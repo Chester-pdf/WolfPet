@@ -40,7 +40,7 @@ jobs:
           fabric_api_version=0.161.0+26.2
 
           # Мод
-          mod_version=1.3.0
+          mod_version=1.3.1
           maven_group=com.wolfplus
           archives_base_name=wolfplus
           WOLFPLUS_EOF
@@ -398,6 +398,7 @@ jobs:
                   if (this.minecraft == null || this.minecraft.level == null) {
                       return;
                   }
+                  Mob mob;
                   try {
                       // В 26.2 констант вида EntityType.WOLF нет - ищем тип в реестре.
                       EntityType<?> type = null;
@@ -408,24 +409,34 @@ jobs:
                           }
                       }
                       if (type == null) {
+                          System.err.println("[wolfplus] preview: entity type not found: " + this.kind.typeId);
                           return;
                       }
                       Entity created = type.create(this.minecraft.level, EntitySpawnReason.LOAD);
-                      if (!(created instanceof Mob mob)) {
+                      if (!(created instanceof Mob m)) {
+                          System.err.println("[wolfplus] preview: could not create " + this.kind.typeId);
                           return;
                       }
+                      mob = m;
                       // Моб вне мира не имеет ID, а рендерер его требует - выдаём фиктивный.
                       mob.setId(PREVIEW_ENTITY_ID);
-                      if (mob instanceof TamableAnimal tamable) {
+                      this.previewBase = Math.max(mob.getBbHeight(), mob.getBbWidth() * 0.9f);
+                  } catch (Throwable ex) {
+                      System.err.println("[wolfplus] preview: creation failed: " + ex);
+                      ex.printStackTrace();
+                      return;
+                  }
+                  // Моделька должна показываться, даже если порода или ошейник не применились.
+                  this.preview = mob;
+                  if (mob instanceof TamableAnimal tamable) {
+                      try {
                           tamable.setTame(true, false);        // ошейник рисуется только у прирученного
                           tamable.setInSittingPose(true);      // сидит, как только что приручённый
+                      } catch (Throwable ex) {
+                          System.err.println("[wolfplus] preview: tame pose failed: " + ex);
                       }
-                      this.previewBase = Math.max(mob.getBbHeight(), mob.getBbWidth() * 0.9f);
-                      this.preview = mob;
-                      updatePreview();
-                  } catch (Throwable ex) {
-                      this.preview = null;
                   }
+                  updatePreview();
               }
 
               private void updatePreview() {
@@ -433,9 +444,19 @@ jobs:
                       return;
                   }
                   if (this.hasVariants) {
-                      this.kind.applyVariant(this.preview, this.variant);
+                      try {
+                          this.kind.applyVariant(this.preview, this.variant);
+                      } catch (Throwable ex) {
+                          System.err.println("[wolfplus] preview: variant failed: " + ex);
+                          ex.printStackTrace();
+                      }
                   }
-                  this.kind.setCollar(this.preview, COLORS[this.color]);
+                  try {
+                      this.kind.setCollar(this.preview, COLORS[this.color]);
+                  } catch (Throwable ex) {
+                      System.err.println("[wolfplus] preview: collar failed: " + ex);
+                      ex.printStackTrace();
+                  }
               }
 
               // ------------------------------------------------------------ подписи и кнопки
@@ -1151,6 +1172,9 @@ jobs:
               /** Летящие питомцы (по UUID питомца). */
               private static final Map<UUID, FlightState> FLIGHTS = new HashMap<>();
 
+              /** Дикие кролики, которых только что кормили морковью: ждём, не приручат ли (мод Rabbit Taming). */
+              private static final Map<UUID, RabbitWatch> RABBIT_WATCH = new HashMap<>();
+
               /** Любое мясо (плюс всё, что ванилла считает едой для волка). */
               private static final Set<Item> MEAT = Set.of(
                       Items.BEEF, Items.COOKED_BEEF,
@@ -1180,6 +1204,17 @@ jobs:
                   int ticks;
               }
 
+              private static final class RabbitWatch {
+                  final UUID player;
+                  final int petId;
+                  int ticksLeft = 10;
+
+                  RabbitWatch(UUID player, int petId) {
+                      this.player = player;
+                      this.petId = petId;
+                  }
+              }
+
               private WolfTaming() {
               }
 
@@ -1193,11 +1228,13 @@ jobs:
                   ServerTickEvents.END_SERVER_TICK.register(server -> {
                       tickPendingMounts(server);
                       tickFlights(server);
+                      tickRabbitWatches(server);
                   });
                   ServerLifecycleEvents.SERVER_STOPPED.register(server -> {
                       PROGRESS.clear();
                       PENDING_MOUNTS.clear();
                       FLIGHTS.clear();
+                      RABBIT_WATCH.clear();
                   });
 
                   // Питомец, сохранённый в полёте (noGravity), после загрузки не должен висеть в воздухе.
@@ -1293,8 +1330,12 @@ jobs:
                       return InteractionResult.PASS; // всё остальное - как в ванилле
                   }
 
-                  // Дикий кролик приручается другим модом (морковью) - не мешаем
+                  // Дикий кролик приручается другим модом (морковью) - не мешаем, но следим,
+                  // чтобы после приручения само открылось меню настройки.
                   if (kind == PetKind.RABBIT) {
+                      if (!client && stack.is(Items.CARROT) && player instanceof ServerPlayer serverPlayer) {
+                          RABBIT_WATCH.put(pet.getUUID(), new RabbitWatch(serverPlayer.getUUID(), pet.getId()));
+                      }
                       return InteractionResult.PASS;
                   }
 
@@ -1346,6 +1387,29 @@ jobs:
                       openMenu(player, pet, true);
                   } else {
                       level.broadcastEntityEvent(pet, (byte) 6); // дымок: пока не вышло
+                  }
+              }
+
+              /** Кролика только что кормили морковью: если он стал ручным, открываем меню настройки. */
+              private static void tickRabbitWatches(MinecraftServer server) {
+                  if (RABBIT_WATCH.isEmpty()) {
+                      return;
+                  }
+                  Iterator<Map.Entry<UUID, RabbitWatch>> it = RABBIT_WATCH.entrySet().iterator();
+                  while (it.hasNext()) {
+                      RabbitWatch watch = it.next().getValue();
+                      ServerPlayer player = server.getPlayerList().getPlayer(watch.player);
+                      if (player == null || --watch.ticksLeft < 0) {
+                          it.remove();
+                          continue;
+                      }
+                      if (player.level().getEntity(watch.petId) instanceof Mob pet
+                              && PetKind.of(pet) == PetKind.RABBIT
+                              && PetKind.isTamed(pet)
+                              && PetKind.isOwnedBy(pet, player)) {
+                          openMenu(player, pet, true);
+                          it.remove();
+                      }
                   }
               }
 
